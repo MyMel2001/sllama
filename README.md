@@ -26,7 +26,7 @@ To install `sllama`, follow these steps:
 2.  **Download the project:**
     Clone this repository or download the `sllama.py` file and the `setup.py` file.
     ```bash
-    git clone [https://git.nodemixaholic.com/sparky/sllama.git](https://git.nodemixaholic.com/sparky/sllama.git)
+    git clone https://git.nodemixaholic.com/sparky/sllama.git
     cd sllama
     ```
 
