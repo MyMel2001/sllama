@@ -63,7 +63,7 @@ def parse_modelfile(filename):
                     if len(param_parts) == 2:
                         param_key = param_parts[0]
                         param_value = param_parts[1]
-                        llama_args.extend([f"-{param_key}", shlex.quote(param_value)])
+                        llama_args.extend([f"--{param_key}", shlex.quote(param_value)])
                     else:
                         print(f"Warning: Modelfile '{filename}' line {line_num}: Malformed PARAMETER line: '{stripped_line}'", file=sys.stderr)
                 elif command == "SYSTEM":
