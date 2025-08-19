@@ -6,7 +6,7 @@ setup(
     author='Sammy Lord', # Replace with your name
     author_email='python.projects@sllord.info', # Replace with your email
     description='A simple frontend for llama.cpp CLI, similar to Ollama.',
-    long_description=open('README.md').read()
+    long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     py_modules=['sllama'], # This tells setuptools that sllama.py is a module
     classifiers=[
