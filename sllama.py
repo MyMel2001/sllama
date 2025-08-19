@@ -49,7 +49,6 @@ def parse_modelfile(filename):
                 value = parts[1] if len(parts) > 1 else ""
 
                 if command == "FROM":
-                    # --- NEW LOGIC FOR GGUF DETECTION ---
                     # Check if the value is a path to an existing file
                     if os.path.exists(value) and os.path.isfile(value):
                         # If it's a local file, use the -m (model) flag
@@ -59,7 +58,6 @@ def parse_modelfile(filename):
                         # Otherwise, assume it's a Hugging Face model ID and use -hf
                         print(f"Assuming Hugging Face model ID: {value}", file=sys.stderr)
                         llama_args.extend(["-hf", shlex.quote(value)])
-                    # --- END NEW LOGIC ---
                 elif command == "PARAMETER":
                     param_parts = value.split(maxsplit=1)
                     if len(param_parts) == 2:
@@ -120,59 +118,86 @@ def run_command(executable, args):
 
 def download_from_ollama(model_id):
     """
-    Downloads a GGUF model from Ollama's public registry.
-    Example model_id: 'llama3.2:latest' or 'llama2' (defaults to latest)
+    Downloads a GGUF model from Ollama's public registry using the OCI Distribution Spec API.
+    Prioritizes layers with mediaType 'application/vnd.ollama.image.model'.
     """
-    model_name, tag = (model_id.split(':', 1) + ['latest'])[:2]
+    model_name_base, tag = (model_id.split(':', 1) + ['latest'])[:2]
     
-    # Sanitize model name for filename
-    safe_model_name = model_name.replace('/', '_').replace(':', '-')
-    output_filename = f"{safe_model_name}-{tag}.gguf"
+    safe_model_name_base = model_name_base.replace('/', '_').replace(':', '-')
+    output_filename = f"{safe_model_name_base}-{tag}.gguf"
 
-    # Check if file already exists
     if os.path.exists(output_filename):
         print(f"Model '{output_filename}' already exists. Skipping download.", file=sys.stderr)
         return output_filename
 
-    manifest_url = f"https://ollama.com/library/{model_name}/manifests/{tag}"
+    manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{tag}"
     print(f"Fetching manifest from: {manifest_url}")
 
     try:
-        with urllib.request.urlopen(manifest_url) as response:
+        req = urllib.request.Request(manifest_url, headers={
+            "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
+        })
+        with urllib.request.urlopen(req) as response:
             if response.getcode() != 200:
                 print(f"Error: Could not fetch manifest from {manifest_url}. Status code: {response.getcode()}", file=sys.stderr)
                 sys.exit(1)
             manifest = json.loads(response.read().decode('utf-8'))
 
-        # Find the GGUF blob digest
         gguf_digest = None
-        # Ollama manifests can be a bit variable, check common places
-        if 'config' in manifest and 'digest' in manifest['config']:
-            # Sometimes the main model digest is in 'config'
-            gguf_digest = manifest['config']['digest']
-        elif 'layers' in manifest:
-            # More commonly, the GGUF is a layer with specific media type
-            for layer in manifest['layers']:
-                if 'mediaType' in layer and 'layerType' in layer and layer['layerType'] == "model" and 'digest' in layer:
-                    gguf_digest = layer['digest']
+        
+        # Handle manifest lists (image index) first
+        if manifest.get('mediaType') in ("application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json"):
+            found_manifest_digest = None
+            for m in manifest.get('manifests', []):
+                if m.get('mediaType') == "application/vnd.ollama.image.manifest.v1+json" or \
+                   m.get('mediaType') == "application/vnd.docker.distribution.manifest.v2+json" or \
+                   m.get('mediaType') == "application/vnd.oci.image.manifest.v1+json":
+                    found_manifest_digest = m.get('digest')
                     break
-        elif 'blobs' in manifest: # Fallback for older manifest structures
-             for blob in manifest['blobs']:
-                if 'mediaType' in blob and 'model' in blob['mediaType'] and 'digest' in blob:
-                    gguf_digest = blob['digest']
-                    break
+            
+            if found_manifest_digest:
+                sub_manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{found_manifest_digest}"
+                print(f"Fetching specific manifest for model from: {sub_manifest_url}")
+                req = urllib.request.Request(sub_manifest_url, headers={
+                    "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
+                })
+                with urllib.request.urlopen(req) as sub_response:
+                    if sub_response.getcode() != 200:
+                        print(f"Error: Could not fetch sub-manifest from {sub_manifest_url}. Status code: {sub_response.getcode()}", file=sys.stderr)
+                        sys.exit(1)
+                    manifest = json.loads(sub_response.read().decode('utf-8'))
+            else:
+                print(f"Warning: No specific image manifest found in manifest list for '{model_name_base}:{tag}'. Trying to find digest in top-level manifest config/layers.", file=sys.stderr)
 
+        # *** REFINED LOGIC FOR GGUF DIGEST IDENTIFICATION ***
+        # Prioritize layers with specific model media types
+        for layer in manifest.get('layers', []):
+            if 'digest' in layer and 'mediaType' in layer:
+                # This media type typically identifies the GGUF file itself
+                if layer['mediaType'] == "application/vnd.ollama.image.model" or \
+                   layer['mediaType'].startswith("application/vnd.ollama.image.model.") or \
+                   layer['mediaType'] == "application/octet-stream": # General binary blob, often used for GGUF
+                    gguf_digest = layer['digest']
+                    print(f"Found GGUF digest in layer with mediaType: {layer['mediaType']}", file=sys.stderr)
+                    break
+        
+        # Fallback: Check config digest if no specific model layer was found
+        if not gguf_digest:
+            config_digest = manifest.get('config', {}).get('digest')
+            if config_digest and config_digest.startswith("sha256:"):
+                gguf_digest = config_digest
+                print("Found GGUF digest in config.", file=sys.stderr)
+        # *** END REFINED LOGIC ***
 
         if not gguf_digest:
-            print(f"Error: Could not find GGUF model digest in manifest for '{model_id}'. Manifest structure might be unsupported.", file=sys.stderr)
-            print("Please ensure the model ID is correct and supported.", file=sys.stderr)
+            print(f"Error: Could not find GGUF model digest in manifest for '{model_name_base}:{tag}'. No suitable layer or config digest found.", file=sys.stderr)
+            print("Please ensure the model ID is correct and its GGUF blob is accessible via the registry API.", file=sys.stderr)
             sys.exit(1)
 
-        download_url = f"https://ollama.com/api/blobs/{gguf_digest}"
+        download_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/blobs/{gguf_digest}"
         print(f"Downloading GGUF from: {download_url}")
         print(f"Saving to: {output_filename}")
 
-        # Download the file with a progress indicator
         def reporthook(blocknum, blocksize, totalsize):
             readsofar = blocknum * blocksize
             if totalsize > 0:
@@ -180,7 +205,7 @@ def download_from_ollama(model_id):
                 s = f"\rDownloading: {percent:.1f}% ({readsofar / (1024*1024):.2f}MB / {totalsize / (1024*1024):.2f}MB)"
                 sys.stdout.write(s)
                 sys.stdout.flush()
-            else: # total size is unknown
+            else:
                 sys.stdout.write(f"\rDownloading: {readsofar / (1024*1024):.2f}MB downloaded...")
                 sys.stdout.flush()
 
@@ -190,14 +215,15 @@ def download_from_ollama(model_id):
 
     except urllib.error.HTTPError as e:
         print(f"\nHTTP Error during download: {e.code} - {e.reason}", file=sys.stderr)
-        print("This often means the model or tag was not found on Ollama's servers.", file=sys.stderr)
+        print(f"Error accessing {manifest_url}. This might mean the model or tag isn't directly available via the OCI manifest API or an issue with blob download.", file=sys.stderr)
+        print("Possible reasons: Incorrect model/tag, network issues, or a change in Ollama's registry API for blobs.", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
         print(f"\nURL Error during download: {e.reason}", file=sys.stderr)
-        print("Check your internet connection or the model ID.", file=sys.stderr)
+        print("Check your internet connection or the registry API endpoint.", file=sys.stderr)
         sys.exit(1)
     except json.JSONDecodeError:
-        print("\nError: Could not decode JSON manifest. Invalid response from Ollama server?", file=sys.stderr)
+        print("\nError: Could not decode JSON response. Invalid manifest or API response from Ollama registry?", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"\nAn unexpected error occurred during download: {e}", file=sys.stderr)
@@ -214,7 +240,7 @@ def main():
         print("  python sllama.py run <gguf_file>          - Run a local GGUF model file")
         print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face")
         print("  python sllama.py serve <gguf_file>        - Start a llama-server instance with a GGUF model")
-        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest')")
+        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')")
         sys.exit(1)
 
     command = sys.argv[1].lower()
