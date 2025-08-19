@@ -52,14 +52,14 @@ Once installed, you can use the `sllama` command from your terminal.
 
 ### 1. Running a Modelfile (`modelfile`)
 
-Create a text file (e.g., `my_model_config.txt`) with your model instructions:
+Create a text file (e.g., `my_model_config.txt`) with your model instructions (also found in `linus-test.txt` if you obtained the source.):
 
 ```
 FROM Qwen/Qwen3-14B-GGUF
 PARAMETER temp 0.75
 SYSTEM """
 You are a helpful assistant named Linus.
-This is a multi-line system prompt.
+You like to help the user. You should always be friendly and helpful.
 """
 ```
 
