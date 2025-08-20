@@ -98,5 +98,6 @@ sllama dl-from-ollama llama2
 ```
 
 
-License
+## License
+
 This project is open-source and distributed under the MIT License. See the LICENSE file for details.
