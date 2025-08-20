@@ -67,8 +67,9 @@ If the `FROM` instruction points to an existing local GGUF file, it will automat
 
 To run it:
 
-```bash
-```sllama modelfile my_model_config.txt```
+```
+sllama modelfile my_model_config.txt
+```
 
 2. Running a Local GGUF File (run)
 To run a GGUF file you already have downloaded (e.g., my_local_model.gguf):
@@ -98,26 +99,7 @@ sllama dl-from-ollama llama2
 
 
 License
-This project is open-source and distributed under the MIT License. See the LICENSE section below for details.
-
-LICENSE
-MIT License
-
-Copyright (c) [year] [fullname]
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+This project is open-source and distributed under the MIT License. See the LICENSE file for details.
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
