@@ -14,7 +14,7 @@ from subprocess import DEVNULL # Import DEVNULL from subprocess for cross-platfo
 
 # Dictionary to store information about models.
 # Initially: model_name: {'gguf_path': 'path/to/gguf'}
-# After activation: model_name: {'gguf_path': 'path/to/gguf', 'port': <port_num>, 'process': <Popen_object>, 'log_file': <file_handle>}
+# After activation: model_name: {'gguf_path': 'path/to/gguf', 'port': <port_num>, 'process': <Popen_object>}
 registered_models = {}
 
 def find_free_port():
@@ -25,35 +25,25 @@ def find_free_port():
 
 def run_llama_server_in_background(gguf_path, model_name, port):
     """
-    Launches a llama-server process in the background, redirecting its output to a log file.
-    Returns the Popen object for the process and the file handle for the log.
+    Launches a llama-server process in the background.
+    Stdout and stderr are redirected to DEVNULL to prevent terminal output clutter.
+    Returns the Popen object for the process.
     """
     executable = "llama-server"
     args = ["-m", shlex.quote(gguf_path), "--port", str(port), "--host", "localhost"]
     command = [executable] + args
-    
-    # Create a unique log file for this llama-server instance
-    # Use model_name and port for uniqueness, replace invalid characters for filenames
-    log_filename = f"llama_server_{model_name.replace('/', '_').replace(':', '-')}_{port}.log"
-    log_file_path = os.path.join(os.getcwd(), log_filename) # Log in the current working directory
-    
-    print(f"\nActivating model '{model_name}': Executing '{executable}' in background on port {port}. Logs to: {log_file_path}", file=sys.stderr)
-    
+    print(f"\nActivating model '{model_name}': Executing '{executable}' in background on port {port}: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
     try:
-        # Open log file for stdout and stderr in append mode ('a+')
-        # This allows you to see continuous output if the server tries to restart
-        log_file_handle = open(log_file_path, 'a+') 
-        process = subprocess.Popen(command, stdout=log_file_handle, stderr=log_file_handle)
-        
-        # Return both the process and the file handle so it can be kept open and closed later
-        return process, log_file_handle
+        # stdout and stderr are redirected to DEVNULL for clean output.
+        process = subprocess.Popen(command, stdout=DEVNULL, stderr=DEVNULL)
+        return process
     except FileNotFoundError:
         print(f"\nError: '{executable}' command not found.", file=sys.stderr)
         print(f"Please ensure '{executable}' is installed and in your system's PATH.", file=sys.stderr)
-        return None, None
+        return None
     except Exception as e:
         print(f"\nAn unexpected error occurred while trying to run {executable} for {model_name}: {e}", file=sys.stderr)
-        return None, None
+        return None
 
 def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 minutes
     """
@@ -67,11 +57,6 @@ def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 m
     ping_url = f"http://localhost:{port}/v1/models"
     print(f"Waiting for '{model_name}' server process to be listening on {ping_url}...", file=sys.stderr)
     while time.time() - start_time < timeout:
-        # Check if the process has terminated while waiting for it to listen
-        if 'process' in registered_models.get(model_name, {}) and registered_models[model_name]['process'].poll() is not None:
-            print(f"Error: '{model_name}' server process terminated while waiting for it to listen.", file=sys.stderr)
-            return False
-
         try:
             response = requests.get(ping_url, timeout=5)
             if response.status_code == 200:
@@ -100,11 +85,6 @@ def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 m
 
     print(f"Sending dummy request to '{model_name}' on {chat_url} to check model loading...", file=sys.stderr)
     while time.time() - start_time < timeout:
-        # Check if the process has terminated while waiting for model readiness
-        if 'process' in registered_models.get(model_name, {}) and registered_models[model_name]['process'].poll() is not None:
-            print(f"Error: '{model_name}' server process terminated while waiting for model readiness.", file=sys.stderr)
-            return False
-            
         try:
             response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=30) # Increased single-request timeout
 
@@ -151,11 +131,6 @@ def activate_model_on_demand(model_name):
     # If 'process' exists but is not running (i.e., it crashed previously), clean it up
     if 'process' in model_info and model_info['process'].poll() is not None:
         print(f"Info: Cleaning up terminated '{model_name}' server (PID {model_info['process'].pid}) before re-launch.", file=sys.stderr)
-        # Close the old log file handle if it exists and is open
-        if 'log_file' in model_info and not model_info['log_file'].closed:
-            model_info['log_file'].close()
-            del model_info['log_file'] # Remove the handle from the dictionary
-        
         del model_info['process']
         if 'port' in model_info: del model_info['port']
     
@@ -166,40 +141,21 @@ def activate_model_on_demand(model_name):
         return False
 
     port = find_free_port()
-    process, log_file_handle = run_llama_server_in_background(gguf_path, model_name, port)
+    process = run_llama_server_in_background(gguf_path, model_name, port)
     if not process:
-        # If process failed to launch, ensure its (potentially opened) log file handle is closed
-        if log_file_handle:
-            log_file_handle.close()
         return False # Failed to launch process
 
-    # Immediately check if the process died right after being spawned
-    if process.poll() is not None:
-        print(f"Error: '{model_name}' server process (PID {process.pid}) died immediately after launch.", file=sys.stderr)
-        if log_file_handle:
-            log_file_handle.close()
-        # Clean up process, port, and log file info
-        if 'process' in registered_models[model_name]: del registered_models[model_name]['process']
-        if 'port' in registered_models[model_name]: del registered_models[model_name]['port']
-        if 'log_file' in registered_models[model_name]: del registered_models[model_name]['log_file']
-        return False
-
-    # Update registered_models with the new process, port, and log file handle
+    # Update registered_models with the new process and port
     registered_models[model_name]['port'] = port
     registered_models[model_name]['process'] = process
-    registered_models[model_name]['log_file'] = log_file_handle # Store the file handle
 
     # Wait for the server to be ready before proceeding
     if not wait_for_server_ready(port, model_name):
         print(f"Failed to activate model '{model_name}'. Terminating unresponsive process.", file=sys.stderr)
         process.terminate() # Terminate the unresponsive process
-        # Close log file if process terminated
-        if 'log_file' in registered_models[model_name] and not registered_models[model_name]['log_file'].closed:
-            registered_models[model_name]['log_file'].close()
         # Clean up process and port info to allow re-attempt later
         if 'process' in registered_models[model_name]: del registered_models[model_name]['process']
         if 'port' in registered_models[model_name]: del registered_models[model_name]['port']
-        if 'log_file' in registered_models[model_name]: del registered_models[model_name]['log_file']
         return False
     
     return True
@@ -260,13 +216,14 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 headers['Host'] = f"localhost:{target_port}"
                 
                 # Make the request to the backend llama-server
+                # THIS TIMEOUT IS ALREADY SET TO 1 HOUR (3600 SECONDS)
                 response = requests.request(
                     method,
                     target_url,
                     headers=headers,
                     data=body,
                     stream=True, # Use stream=True to handle large responses efficiently
-                    timeout=3600 # Increased to 1 hour (3600 seconds) for actual inference
+                    timeout=3600 # Already increased to 1 hour (3600 seconds) for actual inference
                 )
                 break # Request successful, exit retry loop
             except requests.exceptions.ConnectionError as e:
@@ -738,31 +695,17 @@ def main():
                 # Periodically clean up processes that have died
                 for name, info in list(registered_models.items()): # Use list() to allow modification during iteration
                     if 'process' in info and info['process'].poll() is not None:
-                        print(f"Info: Model '{name}' server (PID {info['process'].pid}) has terminated. Checking log file for details...", file=sys.stderr)
-                        # Attempt to print last few lines of log if available
-                        if 'log_file' in info and not info['log_file'].closed:
-                            info['log_file'].seek(0, os.SEEK_END) # Go to end
-                            pos = info['log_file'].tell()
-                            # Read last ~500 bytes (adjust as needed)
-                            info['log_file'].seek(max(0, pos - 500))
-                            last_lines = info['log_file'].read()
-                            print(f"Last log entries for '{name}':\n---START LOG---\n{last_lines}\n---END LOG---", file=sys.stderr)
-
-                        # Remove process, port, and log_file info, keep gguf_path for potential re-activation
-                        if 'process' in registered_models[name]: del registered_models[name]['process']
+                        print(f"Info: Model '{name}' server (PID {info['process'].pid}) has terminated.", file=sys.stderr)
+                        # Remove process and port info, keep gguf_path for potential re-activation
+                        del registered_models[name]['process']
                         if 'port' in registered_models[name]: del registered_models[name]['port']
-                        if 'log_file' in registered_models[name] and not registered_models[name]['log_file'].closed:
-                            registered_models[name]['log_file'].close()
-                            del registered_models[name]['log_file']
                 time.sleep(5) # Check every 5 seconds
         except KeyboardInterrupt:
             print("\nShutting down all servers...", file=sys.stderr)
-            # Terminate all running processes and close their log files
+            # Terminate all running processes
             for info in registered_models.values():
                 if 'process' in info and info['process'].poll() is None: # Check if still running before trying to terminate
                     info['process'].terminate()
-                if 'log_file' in info and not info['log_file'].closed:
-                    info['log_file'].close()
             print("All services stopped. Goodbye! 👋", file=sys.stderr)
             sys.exit(0)
     elif command == "dl-from-ollama":
