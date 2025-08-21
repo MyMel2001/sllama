@@ -44,30 +44,76 @@ def run_llama_server_in_background(gguf_path, model_name, port):
         print(f"\nAn unexpected error occurred while trying to run {executable} for {model_name}: {e}", file=sys.stderr)
         return None
 
-def wait_for_server_ready(port, model_name, timeout=120):
+def wait_for_server_ready(port, model_name, timeout=600): # Increased default timeout to 10 minutes
     """
-    Waits for the llama-server on the given port to become ready by polling its /v1/models endpoint.
+    Waits for the llama-server on the given port to become truly ready
+    by attempting a dummy chat completion request.
     Returns True if ready, False otherwise.
     """
     start_time = time.time()
-    url = f"http://localhost:{port}/v1/models"
-    print(f"Waiting for '{model_name}' server to become ready on {url} (timeout: {timeout}s)...", file=sys.stderr)
+    
+    # First, a basic ping to ensure the server process is listening
+    ping_url = f"http://localhost:{port}/v1/models"
+    print(f"Waiting for '{model_name}' server process to be listening on {ping_url}...", file=sys.stderr)
     while time.time() - start_time < timeout:
         try:
-            response = requests.get(url, timeout=5) # Short timeout for the readiness probe
+            response = requests.get(ping_url, timeout=5)
             if response.status_code == 200:
-                print(f"'{model_name}' server on port {port} is ready! 🎉", file=sys.stderr)
-                return True
+                print(f"'{model_name}' server is listening. Now checking for model readiness...", file=sys.stderr)
+                break # Server is listening, proceed to model readiness check
         except requests.exceptions.ConnectionError:
-            # Server not yet listening or connection refused
-            pass
+            pass # Server not yet listening
         except requests.exceptions.Timeout:
-            # Request timed out, server might be slow to respond
-            pass
+            pass # Request timed out
         except Exception as e:
-            print(f"Unexpected error during readiness check for {model_name}: {e}", file=sys.stderr)
-        time.sleep(1) # Wait 1 second before retrying
-    print(f"Error: '{model_name}' server on port {port} did not become ready within {timeout} seconds.", file=sys.stderr)
+            print(f"Unexpected error during initial ping for {model_name}: {e}", file=sys.stderr)
+        time.sleep(1)
+    else:
+        print(f"Error: '{model_name}' server process on port {port} did not start listening within {timeout} seconds.", file=sys.stderr)
+        return False
+
+    # Second, attempt a dummy chat completion request to verify model loading
+    chat_url = f"http://localhost:{port}/v1/chat/completions"
+    dummy_payload = {
+        "model": model_name, # Use the actual model name as expected by llama-server
+        "messages": [{"role": "user", "content": "hi"}]
+    }
+    headers = {"Content-Type": "application/json"}
+
+    print(f"Sending dummy request to '{model_name}' on {chat_url} to check model loading...", file=sys.stderr)
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=10) # Longer timeout for actual inference
+            # Check for success status code and non-error content.
+            # llama-server will typically return 200 OK when ready,
+            # even if the response is empty for a simple prompt.
+            if response.status_code == 200:
+                try:
+                    # Attempt to parse as JSON and check for typical completion structure
+                    response_json = response.json()
+                    if "choices" in response_json and len(response_json["choices"]) > 0:
+                        print(f"'{model_name}' server on port {port} is ready for inference! 🎉", file=sys.stderr)
+                        return True
+                    else:
+                        print(f"'{model_name}' server on port {port} responded 200, but content not expected: {response.text[:100]}", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"'{model_name}' server on port {port} responded 200, but not valid JSON. Still loading?", file=sys.stderr)
+                
+            elif response.status_code == 400 and "loading model" in response.text.lower():
+                print(f"'{model_name}' is still loading (400 response with 'loading model')...", file=sys.stderr)
+            else:
+                print(f"'{model_name}' server responded with status {response.status_code}: {response.text.strip()[:100]}", file=sys.stderr)
+            
+        except requests.exceptions.ConnectionError:
+            print(f"Connection refused during dummy request for {model_name}. Server might be resetting or still starting...", file=sys.stderr)
+        except requests.exceptions.Timeout:
+            print(f"Dummy request for {model_name} timed out. Still loading?", file=sys.stderr)
+        except Exception as e:
+            print(f"Unexpected error during dummy request for {model_name}: {e}", file=sys.stderr)
+        
+        time.sleep(2) # Wait a bit longer between inference readiness checks
+    
+    print(f"Error: '{model_name}' server on port {port} did not become ready for inference within {timeout} seconds.", file=sys.stderr)
     return False
 
 def activate_model_on_demand(model_name):
@@ -96,16 +142,17 @@ def activate_model_on_demand(model_name):
     if not process:
         return False # Failed to launch process
 
-    # Update registered_models with the new process and port
+    # Temporarily update registered_models with the new process and port
     registered_models[model_name]['port'] = port
     registered_models[model_name]['process'] = process
 
     # Wait for the server to be ready before proceeding
     if not wait_for_server_ready(port, model_name):
         print(f"Failed to activate model '{model_name}'. Terminating process.", file=sys.stderr)
-        process.terminate()
-        del registered_models[model_name]['process'] # Remove process info
-        if 'port' in registered_models[model_name]: del registered_models[model_name]['port'] # Remove port info
+        process.terminate() # Terminate the unresponsive process
+        # Clean up process and port info to allow re-attempt later
+        if 'process' in registered_models[model_name]: del registered_models[model_name]['process']
+        if 'port' in registered_models[model_name]: del registered_models[model_name]['port']
         return False
     
     return True
@@ -215,7 +262,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 models_data = []
                 print(f"DEBUG (GET /v1/models): Currently registered models: {list(registered_models.keys())}", file=sys.stderr)
                 for name, info in registered_models.items():
-                    # Determine if the model is currently active
+                    # Determine if the model is currently active (process exists and is running)
                     is_active = 'process' in info and info['process'].poll() is None
                     models_data.append({
                         "id": name,
@@ -629,7 +676,7 @@ def main():
                 continue
             
             registered_models[model_name] = {'gguf_path': gguf_file}
-            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
+            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_path}'.", file=sys.stderr)
         
         if not registered_models:
             print("No models registered. Router will not serve any models.", file=sys.stderr)
