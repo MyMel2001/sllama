@@ -96,6 +96,11 @@ sllama dl-from-ollama llama3.2:latest
 sllama dl-from-ollama llama2
 ```
 
+## Notes for Windows 7 compatibility
+
+* Use Vulkan edition
+* Use VxKex-Next with Windows 10 OS on the "exe" files for llama.cpp
+* Use version 'b6209'
 
 ## License
 
