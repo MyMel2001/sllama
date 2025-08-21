@@ -16,6 +16,8 @@ from subprocess import DEVNULL # Import DEVNULL from subprocess for cross-platfo
 # Initially: model_name: {'gguf_path': 'path/to/gguf'}
 # After activation: model_name: {'gguf_path': 'path/to/gguf', 'port': <port_num>, 'process': <Popen_object>}
 registered_models = {}
+current_model = ""
+
 
 def find_free_port():
     """Finds a free port on the system by binding to a random ephemeral port."""
@@ -23,10 +25,64 @@ def find_free_port():
         s.bind(('', 0)) # Bind to port 0 to let the OS choose a free port
         return s.getsockname()[1] # Return the chosen port number
 
+def kill_llama_servers_graceful(timeout: float = 5.0, check_interval: float = 0.25):
+    # Try to use psutil if available for smart process lookup
+    procs = []
+    try:
+        import psutil
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = (p.info.get('name') or '')
+                cmdline = ' '.join(p.info.get('cmdline') or [])
+                if 'llama-server' in name or 'llama-server' in cmdline:
+                    procs.append(p)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        procs = []
+
+    if not procs:
+        # Fallback: try a broad kill via shell
+        subprocess.run(["pkill", "-f", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        return
+
+    pid_list = [p.pid for p in procs]
+    print(f"Found existing llama-server processes: {pid_list}")
+
+    # Attempt graceful termination
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        alive = []
+        for p in procs:
+            try:
+                if p.is_running():
+                    alive.append(p)
+            except Exception:
+                pass
+        if not alive:
+            break
+        time.sleep(check_interval)
+
+    # Force kill any that still linger
+    for p in procs:
+        try:
+            if p.is_running():
+                p.kill()
+        except Exception:
+            pass
+    # Give a moment to terminate
+    time.sleep(0.2)
+
 def run_llama_server_in_background(gguf_path, model_name, port):
     """
     Launches a llama-server process in the background.
-    Stdout and stderr are redirected to DEVNULL to prevent terminal output clutter.
     Returns the Popen object for the process.
     """
     executable = "llama-server"
@@ -34,7 +90,7 @@ def run_llama_server_in_background(gguf_path, model_name, port):
     command = [executable] + args
     print(f"\nActivating model '{model_name}': Executing '{executable}' in background on port {port}: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
     try:
-        # stdout and stderr are redirected to DEVNULL for clean output.
+        # stdout and stderr are redirected to DEVNULL to keep the main console clean.
         process = subprocess.Popen(command, stdout=DEVNULL, stderr=DEVNULL)
         return process
     except FileNotFoundError:
@@ -45,7 +101,7 @@ def run_llama_server_in_background(gguf_path, model_name, port):
         print(f"\nAn unexpected error occurred while trying to run {executable} for {model_name}: {e}", file=sys.stderr)
         return None
 
-def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 minutes
+def wait_for_server_ready(port, model_name, timeout=600): # Increased default timeout to 10 minutes
     """
     Waits for the llama-server on the given port to become truly ready
     by attempting a dummy chat completion request.
@@ -86,7 +142,7 @@ def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 m
     print(f"Sending dummy request to '{model_name}' on {chat_url} to check model loading...", file=sys.stderr)
     while time.time() - start_time < timeout:
         try:
-            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=3600) # Increased single-request timeout
+            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=30) # Increased single-request timeout
 
             # Check for success: 200 OK and not containing "loading model" explicitly
             response_text = response.text.lower()
@@ -113,7 +169,6 @@ def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 m
 def activate_model_on_demand(model_name):
     """
     Activates a model by launching its llama-server process if it's not already running.
-    If a previous process for this model is still active, it will be terminated first.
     Updates the registered_models dictionary with port and process info.
     Returns True on success, False on failure.
     """
@@ -122,20 +177,10 @@ def activate_model_on_demand(model_name):
         print(f"Error: Model '{model_name}' is not registered.", file=sys.stderr)
         return False
 
-    # Check if this model is already running and if so, terminate it for a fresh start
-    if 'process' in model_info:
-        if model_info['process'].poll() is None: # Process is still running
-            print(f"Info: Terminating existing '{model_name}' server (PID {model_info['process'].pid}) for a fresh launch.", file=sys.stderr)
-            model_info['process'].terminate()
-            try:
-                model_info['process'].wait(timeout=10) # Give it some time to terminate
-            except subprocess.TimeoutExpired:
-                print(f"Warning: '{model_name}' server (PID {model_info['process'].pid}) did not terminate gracefully. Killing.", file=sys.stderr)
-                model_info['process'].kill()
-        
-        # Clean up process and port info regardless, to ensure a clean state before re-launch
-        if 'process' in model_info: del model_info['process']
-        if 'port' in model_info: del model_info['port']
+    # Check if already running and active
+    if 'process' in model_info and model_info['process'].poll() is None:
+        print(f"Model '{model_name}' is already active on port {model_info['port']}.", file=sys.stderr)
+        return True
 
     gguf_path = model_info.get('gguf_path')
     if not gguf_path or not os.path.exists(gguf_path):
@@ -143,17 +188,18 @@ def activate_model_on_demand(model_name):
         return False
 
     port = find_free_port()
+    kill_llama_servers_graceful()
     process = run_llama_server_in_background(gguf_path, model_name, port)
     if not process:
         return False # Failed to launch process
 
-    # Update registered_models with the new process and port
+    # Temporarily update registered_models with the new process and port
     registered_models[model_name]['port'] = port
     registered_models[model_name]['process'] = process
 
     # Wait for the server to be ready before proceeding
     if not wait_for_server_ready(port, model_name):
-        print(f"Failed to activate model '{model_name}'. Terminating unresponsive process.", file=sys.stderr)
+        print(f"Failed to activate model '{model_name}'. Terminating process.", file=sys.stderr)
         process.terminate() # Terminate the unresponsive process
         # Clean up process and port info to allow re-attempt later
         if 'process' in registered_models[model_name]: del registered_models[model_name]['process']
@@ -190,9 +236,12 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         forwarded_path: The path to send to the backend llama-server (e.g., "/v1/chat/completions")
         """
         # Ensure the model is active before attempting to forward
-        if not activate_model_on_demand(model_name):
-            self.send_error(503, f"Failed to activate model '{model_name}'. Service Unavailable.")
-            return
+        if (model_name != current_model):
+            if not activate_model_on_demand(model_name):
+                self.send_error(503, f"Failed to activate model '{model_name}'. Service Unavailable.")
+                return
+            current_model = model_name;
+        return
 
         target_port = registered_models[model_name]['port']
         # Construct the target URL using the backend's port and the rewritten path
@@ -218,14 +267,13 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 headers['Host'] = f"localhost:{target_port}"
                 
                 # Make the request to the backend llama-server
-                # INCREASED TIMEOUT FOR THE ACTUAL FORWARDED REQUEST
                 response = requests.request(
                     method,
                     target_url,
                     headers=headers,
                     data=body,
                     stream=True, # Use stream=True to handle large responses efficiently
-                    timeout=3600 # Increased to 1 hour (3600 seconds) for actual inference
+                    timeout=600 # Long timeout for LLM inference
                 )
                 break # Request successful, exit retry loop
             except requests.exceptions.ConnectionError as e:
@@ -238,7 +286,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 time.sleep(backoff_factor * (2 ** i)) # Exponential backoff
         else:
             # All retries failed
-            self.send_error(504, f"Failed to connect to model server after {retries} retries or request timed out.")
+            self.send_error(504, f"Failed to connect to model server after {retries} retries.")
             return
 
         # Forward the response from the backend server back to the original client
@@ -636,12 +684,12 @@ def main():
     """
     if len(sys.argv) < 2:
         print("Usage:", file=sys.stderr)
-        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile", file=sys.stderr)
-        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file", file=sys.stderr)
-        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face", file=sys.stderr)
-        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
-        print("     - Starts the auto-router on port 11337 and registers models for on-demand loading.", file=sys.stderr)
-        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')", file=sys.stderr)
+        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile", file=sys.stderr)
+        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file", file=sys.stderr)
+        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face", file=sys.stderr)
+        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
+        print("     - Starts the auto-router on port 11337 and registers models for on-demand loading.", file=sys.stderr)
+        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')", file=sys.stderr)
         sys.exit(1)
 
     command = sys.argv[1].lower()
@@ -682,6 +730,7 @@ def main():
                 continue
             
             registered_models[model_name] = {'gguf_path': gguf_file}
+            # Fix: Use 'gguf_file' instead of 'gguf_path' in the f-string, as 'gguf_file' is the local variable
             print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         
         if not registered_models:
