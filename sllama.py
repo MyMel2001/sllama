@@ -676,7 +676,8 @@ def main():
                 continue
             
             registered_models[model_name] = {'gguf_path': gguf_file}
-            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_path}'.", file=sys.stderr)
+            # Fix: Use 'gguf_file' instead of 'gguf_path' in the f-string, as 'gguf_file' is the local variable
+            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         
         if not registered_models:
             print("No models registered. Router will not serve any models.", file=sys.stderr)
