@@ -75,45 +75,38 @@ def wait_for_server_ready(port, model_name, timeout=600): # Increased default ti
     # Second, attempt a dummy chat completion request to verify model loading
     chat_url = f"http://localhost:{port}/v1/chat/completions"
     dummy_payload = {
-        "model": model_name, # Correctly using model_name here
-        "messages": [{"role": "user", "content": "hi"}]
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.1, # Use a low temperature for more deterministic/fast response
+        "max_tokens": 1 # Request minimal output
     }
     headers = {"Content-Type": "application/json"}
 
     print(f"Sending dummy request to '{model_name}' on {chat_url} to check model loading...", file=sys.stderr)
     while time.time() - start_time < timeout:
         try:
-            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=10) # Longer timeout for actual inference
-            # Check for success status code and non-error content.
-            # llama-server will typically return 200 OK when ready,
-            # even if the response is empty for a simple prompt.
-            if response.status_code == 200:
-                try:
-                    # Attempt to parse as JSON and check for typical completion structure
-                    response_json = response.json()
-                    if "choices" in response_json and len(response_json["choices"]) > 0:
-                        print(f"'{model_name}' server on port {port} is ready for inference! 🎉", file=sys.stderr)
-                        return True
-                    else:
-                        print(f"'{model_name}' server on port {port} responded 200, but content not expected: {response.text[:100]}", file=sys.stderr)
-                except json.JSONDecodeError:
-                    print(f"'{model_name}' server on port {port} responded 200, but not valid JSON. Still loading?", file=sys.stderr)
-                
-            elif response.status_code == 400 and "loading model" in response.text.lower():
+            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=30) # Increased single-request timeout
+
+            # Check for success: 200 OK and not containing "loading model" explicitly
+            response_text = response.text.lower()
+            if response.status_code == 200 and "loading model" not in response_text and "error" not in response_text:
+                print(f"'{model_name}' server on port {port} is ready for inference! 🎉", file=sys.stderr)
+                return True
+            elif response.status_code == 400 and "loading model" in response_text:
                 print(f"'{model_name}' is still loading (400 response with 'loading model')...", file=sys.stderr)
             else:
-                print(f"'{model_name}' server responded with status {response.status_code}: {response.text.strip()[:100]}", file=sys.stderr)
+                print(f"'{model_name}' server responded with status {response.status_code}. Response (first 100 chars): {response.text.strip()[:100]}", file=sys.stderr)
             
         except requests.exceptions.ConnectionError:
             print(f"Connection refused during dummy request for {model_name}. Server might be resetting or still starting...", file=sys.stderr)
         except requests.exceptions.Timeout:
-            print(f"Dummy request for {model_name} timed out. Still loading?", file=sys.stderr)
+            print(f"Dummy request for {model_name} timed out ({time.time() - start_time:.1f}/{timeout:.1f}s). Still loading?", file=sys.stderr)
         except Exception as e:
             print(f"Unexpected error during dummy request for {model_name}: {e}", file=sys.stderr)
         
-        time.sleep(2) # Wait a bit longer between inference readiness checks
+        time.sleep(5) # Wait a bit longer between inference readiness checks, as model loading can be slow
     
-    print(f"Error: '{model_name}' server on port {port} did not become ready for inference within {timeout} seconds.", file=sys.stderr)
+    print(f"Error: '{model_name}' server on port {port} did not become ready for inference within {timeout} seconds. Final response was: {response_text if 'response_text' in locals() else 'No response'}", file=sys.stderr)
     return False
 
 def activate_model_on_demand(model_name):
