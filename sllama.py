@@ -26,6 +26,7 @@ def find_free_port():
 def run_llama_server_in_background(gguf_path, model_name, port):
     """
     Launches a llama-server process in the background.
+    Stdout and stderr are redirected to DEVNULL to prevent terminal output clutter.
     Returns the Popen object for the process.
     """
     executable = "llama-server"
@@ -33,7 +34,7 @@ def run_llama_server_in_background(gguf_path, model_name, port):
     command = [executable] + args
     print(f"\nActivating model '{model_name}': Executing '{executable}' in background on port {port}: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
     try:
-        # stdout and stderr are redirected to DEVNULL to keep the main console clean.
+        # stdout and stderr are redirected to DEVNULL for clean output.
         process = subprocess.Popen(command, stdout=DEVNULL, stderr=DEVNULL)
         return process
     except FileNotFoundError:
@@ -44,7 +45,7 @@ def run_llama_server_in_background(gguf_path, model_name, port):
         print(f"\nAn unexpected error occurred while trying to run {executable} for {model_name}: {e}", file=sys.stderr)
         return None
 
-def wait_for_server_ready(port, model_name, timeout=600): # Increased default timeout to 10 minutes
+def wait_for_server_ready(port, model_name, timeout=600): # Default timeout 10 minutes
     """
     Waits for the llama-server on the given port to become truly ready
     by attempting a dummy chat completion request.
@@ -85,7 +86,7 @@ def wait_for_server_ready(port, model_name, timeout=600): # Increased default ti
     print(f"Sending dummy request to '{model_name}' on {chat_url} to check model loading...", file=sys.stderr)
     while time.time() - start_time < timeout:
         try:
-            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=30) # Increased single-request timeout
+            response = requests.post(chat_url, json=dummy_payload, headers=headers, timeout=3600) # Increased single-request timeout
 
             # Check for success: 200 OK and not containing "loading model" explicitly
             response_text = response.text.lower()
@@ -112,6 +113,7 @@ def wait_for_server_ready(port, model_name, timeout=600): # Increased default ti
 def activate_model_on_demand(model_name):
     """
     Activates a model by launching its llama-server process if it's not already running.
+    If a previous process for this model is still active, it will be terminated first.
     Updates the registered_models dictionary with port and process info.
     Returns True on success, False on failure.
     """
@@ -120,10 +122,20 @@ def activate_model_on_demand(model_name):
         print(f"Error: Model '{model_name}' is not registered.", file=sys.stderr)
         return False
 
-    # Check if already running and active
-    if 'process' in model_info and model_info['process'].poll() is None:
-        print(f"Model '{model_name}' is already active on port {model_info['port']}.", file=sys.stderr)
-        return True
+    # Check if this model is already running and if so, terminate it for a fresh start
+    if 'process' in model_info:
+        if model_info['process'].poll() is None: # Process is still running
+            print(f"Info: Terminating existing '{model_name}' server (PID {model_info['process'].pid}) for a fresh launch.", file=sys.stderr)
+            model_info['process'].terminate()
+            try:
+                model_info['process'].wait(timeout=10) # Give it some time to terminate
+            except subprocess.TimeoutExpired:
+                print(f"Warning: '{model_name}' server (PID {model_info['process'].pid}) did not terminate gracefully. Killing.", file=sys.stderr)
+                model_info['process'].kill()
+        
+        # Clean up process and port info regardless, to ensure a clean state before re-launch
+        if 'process' in model_info: del model_info['process']
+        if 'port' in model_info: del model_info['port']
 
     gguf_path = model_info.get('gguf_path')
     if not gguf_path or not os.path.exists(gguf_path):
@@ -135,13 +147,13 @@ def activate_model_on_demand(model_name):
     if not process:
         return False # Failed to launch process
 
-    # Temporarily update registered_models with the new process and port
+    # Update registered_models with the new process and port
     registered_models[model_name]['port'] = port
     registered_models[model_name]['process'] = process
 
     # Wait for the server to be ready before proceeding
     if not wait_for_server_ready(port, model_name):
-        print(f"Failed to activate model '{model_name}'. Terminating process.", file=sys.stderr)
+        print(f"Failed to activate model '{model_name}'. Terminating unresponsive process.", file=sys.stderr)
         process.terminate() # Terminate the unresponsive process
         # Clean up process and port info to allow re-attempt later
         if 'process' in registered_models[model_name]: del registered_models[model_name]['process']
@@ -206,13 +218,14 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 headers['Host'] = f"localhost:{target_port}"
                 
                 # Make the request to the backend llama-server
+                # INCREASED TIMEOUT FOR THE ACTUAL FORWARDED REQUEST
                 response = requests.request(
                     method,
                     target_url,
                     headers=headers,
                     data=body,
                     stream=True, # Use stream=True to handle large responses efficiently
-                    timeout=600 # Long timeout for LLM inference
+                    timeout=3600 # Increased to 1 hour (3600 seconds) for actual inference
                 )
                 break # Request successful, exit retry loop
             except requests.exceptions.ConnectionError as e:
@@ -225,7 +238,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 time.sleep(backoff_factor * (2 ** i)) # Exponential backoff
         else:
             # All retries failed
-            self.send_error(504, f"Failed to connect to model server after {retries} retries.")
+            self.send_error(504, f"Failed to connect to model server after {retries} retries or request timed out.")
             return
 
         # Forward the response from the backend server back to the original client
@@ -537,7 +550,7 @@ def download_from_ollama(model_id):
             for m in manifest.get('manifests', []):
                 if m.get('mediaType') == "application/vnd.ollama.image.manifest.v1+json" or \
                    m.get('mediaType') == "application/vnd.docker.distribution.manifest.v2+json" or \
-                   m.get('mediaType') == "application/vnd.oci.image.manifest.v1+json":
+                   m.get('mediaType'] == "application/vnd.oci.image.manifest.v1+json"):
                     found_manifest_digest = m.get('digest')
                     break
             
@@ -669,7 +682,6 @@ def main():
                 continue
             
             registered_models[model_name] = {'gguf_path': gguf_file}
-            # Fix: Use 'gguf_file' instead of 'gguf_path' in the f-string, as 'gguf_file' is the local variable
             print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         
         if not registered_models:
