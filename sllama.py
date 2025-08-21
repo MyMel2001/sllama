@@ -12,9 +12,10 @@ import requests
 import time
 from subprocess import DEVNULL # Import DEVNULL from subprocess for cross-platform compatibility
 
-# Dictionary to store information about running llama-server processes
-# Keys are model names (e.g., "deepseek-r1.gguf"), values are dictionaries with 'port' and 'process'
-running_models = {}
+# Dictionary to store information about models.
+# Initially: model_name: {'gguf_path': 'path/to/gguf'}
+# After activation: model_name: {'gguf_path': 'path/to/gguf', 'port': <port_num>, 'process': <Popen_object>}
+registered_models = {}
 
 def find_free_port():
     """Finds a free port on the system by binding to a random ephemeral port."""
@@ -22,34 +23,100 @@ def find_free_port():
         s.bind(('', 0)) # Bind to port 0 to let the OS choose a free port
         return s.getsockname()[1] # Return the chosen port number
 
-def run_command_in_background(executable, args, name, port):
+def run_llama_server_in_background(gguf_path, model_name, port):
     """
-    Executes an external command (like llama-server) in the background.
-    It stores the process object in 'running_models' for later management.
-    Stdout and stderr are redirected to DEVNULL to prevent terminal output clutter.
+    Launches a llama-server process in the background.
+    Returns the Popen object for the process.
     """
+    executable = "llama-server"
+    args = ["-m", shlex.quote(gguf_path), "--port", str(port), "--host", "localhost"]
     command = [executable] + args
-    print(f"\nExecuting '{name}' in background: {' '.join(shlex.quote(arg) for arg in command)}")
+    print(f"\nActivating model '{model_name}': Executing '{executable}' in background on port {port}: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
     try:
-        # Popen runs the command asynchronously.
-        # stdout and stderr are redirected to subprocess.DEVNULL for clean output.
+        # stdout and stderr are redirected to DEVNULL to keep the main console clean.
         process = subprocess.Popen(command, stdout=DEVNULL, stderr=DEVNULL)
-        running_models[name] = {'port': port, 'process': process}
-        print(f"Server for '{name}' started on port {port} with PID {process.pid}.")
+        return process
     except FileNotFoundError:
         print(f"\nError: '{executable}' command not found.", file=sys.stderr)
         print(f"Please ensure '{executable}' is installed and in your system's PATH.", file=sys.stderr)
-        sys.exit(1)
+        return None
     except Exception as e:
-        print(f"\nAn unexpected error occurred while trying to run {executable}: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"\nAn unexpected error occurred while trying to run {executable} for {model_name}: {e}", file=sys.stderr)
+        return None
 
-def is_port_in_use(port, host='127.0.0.1'): # Check localhost for existing listeners
+def wait_for_server_ready(port, model_name, timeout=120):
+    """
+    Waits for the llama-server on the given port to become ready by polling its /v1/models endpoint.
+    Returns True if ready, False otherwise.
+    """
+    start_time = time.time()
+    url = f"http://localhost:{port}/v1/models"
+    print(f"Waiting for '{model_name}' server to become ready on {url} (timeout: {timeout}s)...", file=sys.stderr)
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(url, timeout=5) # Short timeout for the readiness probe
+            if response.status_code == 200:
+                print(f"'{model_name}' server on port {port} is ready! 🎉", file=sys.stderr)
+                return True
+        except requests.exceptions.ConnectionError:
+            # Server not yet listening or connection refused
+            pass
+        except requests.exceptions.Timeout:
+            # Request timed out, server might be slow to respond
+            pass
+        except Exception as e:
+            print(f"Unexpected error during readiness check for {model_name}: {e}", file=sys.stderr)
+        time.sleep(1) # Wait 1 second before retrying
+    print(f"Error: '{model_name}' server on port {port} did not become ready within {timeout} seconds.", file=sys.stderr)
+    return False
+
+def activate_model_on_demand(model_name):
+    """
+    Activates a model by launching its llama-server process if it's not already running.
+    Updates the registered_models dictionary with port and process info.
+    Returns True on success, False on failure.
+    """
+    model_info = registered_models.get(model_name)
+    if not model_info:
+        print(f"Error: Model '{model_name}' is not registered.", file=sys.stderr)
+        return False
+
+    # Check if already running and active
+    if 'process' in model_info and model_info['process'].poll() is None:
+        print(f"Model '{model_name}' is already active on port {model_info['port']}.", file=sys.stderr)
+        return True
+
+    gguf_path = model_info.get('gguf_path')
+    if not gguf_path or not os.path.exists(gguf_path):
+        print(f"Error: GGUF file path not found or invalid for model '{model_name}': {gguf_path}", file=sys.stderr)
+        return False
+
+    port = find_free_port()
+    process = run_llama_server_in_background(gguf_path, model_name, port)
+    if not process:
+        return False # Failed to launch process
+
+    # Update registered_models with the new process and port
+    registered_models[model_name]['port'] = port
+    registered_models[model_name]['process'] = process
+
+    # Wait for the server to be ready before proceeding
+    if not wait_for_server_ready(port, model_name):
+        print(f"Failed to activate model '{model_name}'. Terminating process.", file=sys.stderr)
+        process.terminate()
+        del registered_models[model_name]['process'] # Remove process info
+        if 'port' in registered_models[model_name]: del registered_models[model_name]['port'] # Remove port info
+        return False
+    
+    return True
+
+
+def is_port_in_use(port, host='127.0.0.1'):
     """Checks if a given TCP port is currently in use on a specified host."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Allow reuse of local addresses
             s.bind((host, port)) # Try to bind to the port
-            s.close() # Release the port immediately
             return False # If successful, port is free
         except OSError:
             return True # If binding fails, port is in use
@@ -60,6 +127,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
     llama-server instance, supporting both OpenAI-like API calls
     (model in JSON body or specific /v1/models paths) and custom routing
     (model name as first path segment).
+    Models are loaded on demand.
     """
 
     def _forward_request(self, method, model_name, forwarded_path, body=None):
@@ -69,11 +137,12 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         model_name: The identified name of the model (e.g., "deepseek-r1.gguf")
         forwarded_path: The path to send to the backend llama-server (e.g., "/v1/chat/completions")
         """
-        if model_name not in running_models:
-            self.send_error(404, f"Model '{model_name}' not found or not running.")
+        # Ensure the model is active before attempting to forward
+        if not activate_model_on_demand(model_name):
+            self.send_error(503, f"Failed to activate model '{model_name}'. Service Unavailable.")
             return
 
-        target_port = running_models[model_name]['port']
+        target_port = registered_models[model_name]['port']
         # Construct the target URL using the backend's port and the rewritten path
         # Backend llama-server instances are still bound to localhost for security/isolation
         target_url = f"http://localhost:{target_port}{forwarded_path}"
@@ -83,7 +152,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         if parsed_original_path.query:
             target_url += f"?{parsed_original_path.query}"
 
-        print(f"Routing {method} request for model '{model_name}' to backend: {target_url}")
+        print(f"Routing {method} request for model '{model_name}' to backend: {target_url}", file=sys.stderr)
 
         retries = 3
         backoff_factor = 0.5 # Initial delay in seconds
@@ -107,7 +176,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 )
                 break # Request successful, exit retry loop
             except requests.exceptions.ConnectionError as e:
-                # Handle connection errors (e.g., backend server not ready)
+                # Handle connection errors (e.g., backend server died after activation)
                 print(f"Connection error to {target_url}: {e}. Retrying in {backoff_factor * (2 ** i):.1f} seconds...", file=sys.stderr)
                 time.sleep(backoff_factor * (2 ** i)) # Exponential backoff
             except requests.exceptions.Timeout as e:
@@ -136,26 +205,31 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         # Example: GET http://<router_ip>:11337/v1/models
         # Example: GET http://<router_ip>:11337/v1/models/model_id
         if path_segments and path_segments[0] == "v1" and len(path_segments) >= 2 and path_segments[1] == "models":
-            # If it's /v1/models or /v1/models/ (list models)
+            # If it's just /v1/models or /v1/models/ (list all *registered* models,
+            # indicating active state based on process.poll() status)
             if len(path_segments) == 2 or (len(path_segments) == 3 and not path_segments[2]):
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 
                 models_data = []
-                for name, info in running_models.items():
-                    if info['process'].poll() is None: # Check if the backend process is still running
-                        models_data.append({
-                            "id": name,
-                            "object": "model",
-                            "created": int(time.time()), # Mock creation time
-                            "owned_by": "local",
-                            "permission": [
-                                {"id": f"model-perm-{name}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
-                            ],
-                            "root": name,
-                            "parent": None
-                        })
+                print(f"DEBUG (GET /v1/models): Currently registered models: {list(registered_models.keys())}", file=sys.stderr)
+                for name, info in registered_models.items():
+                    # Determine if the model is currently active
+                    is_active = 'process' in info and info['process'].poll() is None
+                    models_data.append({
+                        "id": name,
+                        "object": "model",
+                        "created": int(time.time()), # Mock creation time
+                        "owned_by": "local",
+                        "active": is_active, # Indicate if the model is currently loaded/active
+                        "permission": [
+                            {"id": f"model-perm-{name}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
+                        ],
+                        "root": name,
+                        "parent": None
+                    })
+                print(f"DEBUG (GET /v1/models): Listing {len(models_data)} registered models (active status shown).", file=sys.stderr)
                 
                 response_payload = {
                     "object": "list",
@@ -163,26 +237,42 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 }
                 self.wfile.write(json.dumps(response_payload).encode('utf-8'))
                 return
-            # If it's /v1/models/<model_id>
+            # If it's /v1/models/<model_id> (get details for a specific model)
             elif len(path_segments) >= 3:
                 model_id_from_path = path_segments[2]
-                if model_id_from_path in running_models:
-                    # Forward exactly '/v1/models/<model_id>' to the backend
-                    forwarded_path = f"/v1/models/{model_id_from_path}"
-                    self._forward_request(method='GET', model_name=model_id_from_path, forwarded_path=forwarded_path)
+                if model_id_from_path in registered_models:
+                    model_info = registered_models[model_id_from_path]
+                    is_active = 'process' in model_info and model_info['process'].poll() is None
+                    response_model_info = {
+                        "id": model_id_from_path,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "local",
+                        "active": is_active, # Indicate if the model is currently loaded/active
+                        "permission": [
+                            {"id": f"model-perm-{model_id_from_path}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
+                        ],
+                        "root": model_id_from_path,
+                        "parent": None
+                    }
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response_model_info).encode('utf-8'))
                     return
                 else:
-                    self.send_error(404, f"Model '{model_id_from_path}' not found or not running.")
+                    self.send_error(404, f"Model '{model_id_from_path}' not found.")
                     return
         
         # Case 2: Custom Routing - model name as first path segment
         # Example: GET http://<router_ip>:11337/deepseek-r1.gguf/v1/chat/completions
-        if path_segments and path_segments[0] in running_models:
+        if path_segments and path_segments[0] in registered_models:
             model_name_from_path = path_segments[0]
+            # _forward_request will call activate_model_on_demand internally
+            
             # Rewrite path: remove the model name segment for the backend server
             forwarded_path = '/' + '/'.join(path_segments[1:])
-            # Ensure the forwarded path starts with /
-            if not forwarded_path.startswith('/'):
+            if not forwarded_path.startswith('/'): # Ensure leading slash
                 forwarded_path = '/' + forwarded_path
             
             self._forward_request(method='GET', model_name=model_name_from_path, forwarded_path=forwarded_path)
@@ -222,11 +312,12 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 self.send_error(400, "For /v1/chat/completions or /v1/completions, the 'model' field is required in the JSON body.")
                 return
 
-            if model_name_from_body not in running_models:
-                self.send_error(404, f"Model '{model_name_from_body}' not found or not running. "
-                                     f"Available models: {', '.join(running_models.keys())}")
+            if model_name_from_body not in registered_models:
+                self.send_error(404, f"Model '{model_name_from_body}' not registered. "
+                                     f"Registered models: {', '.join(registered_models.keys())}")
                 return
 
+            # _forward_request will call activate_model_on_demand internally
             # Forward the exact OpenAI-standard path to the backend
             forwarded_path = parsed_path.path # e.g., /v1/chat/completions
             self._forward_request(method='POST', model_name=model_name_from_body, forwarded_path=forwarded_path, body=body)
@@ -234,12 +325,13 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         
         # Case 2: Custom Routing - model name as first path segment for POST requests
         # Example: POST http://<router_ip>:11337/deepseek-r1.gguf/v1/chat/completions
-        if path_segments and path_segments[0] in running_models:
+        if path_segments and path_segments[0] in registered_models:
             model_name_from_path = path_segments[0]
+            # _forward_request will call activate_model_on_demand internally
+            
             # Rewrite path: remove the model name segment for the backend server
             forwarded_path = '/' + '/'.join(path_segments[1:])
-            # Ensure the forwarded path starts with /
-            if not forwarded_path.startswith('/'):
+            if not forwarded_path.startswith('/'): # Ensure leading slash
                 forwarded_path = '/' + forwarded_path
             
             self._forward_request(method='POST', model_name=model_name_from_path, forwarded_path=forwarded_path, body=body)
@@ -254,10 +346,10 @@ def run_router():
     router_port = 11337
     # Explicitly try to bind to '0.0.0.0' to check if the port is in use globally
     if is_port_in_use(router_port, host='0.0.0.0'): 
-        print(f"Router is already running on port {router_port}. Skipping starting a new one.")
+        print(f"Router is already running on port {router_port}. Skipping starting a new one.", file=sys.stderr)
         return
 
-    print(f"Starting auto-router on port {router_port}...")
+    print(f"Starting auto-router on port {router_port}...", file=sys.stderr)
     # Bind the server to '0.0.0.0' to listen on all available network interfaces
     server_address = ('0.0.0.0', router_port) 
     # Use ThreadingHTTPServer for better concurrency when handling multiple client requests
@@ -265,9 +357,9 @@ def run_router():
     router_thread = threading.Thread(target=httpd.serve_forever)
     router_thread.daemon = True # Allows the main thread to exit, which will also terminate this thread
     router_thread.start()
-    print(f"Auto-router started on http://0.0.0.0:{router_port}. This means it's accessible from any IP address on your network. Check your firewall if issues occur. Press Ctrl+C to stop all services.")
+    print(f"Auto-router started on http://0.0.0.0:{router_port}. This means it's accessible from any IP address on your network. Check your firewall if issues occur. Press Ctrl+C to stop all services.", file=sys.stderr)
 
-# --- Original functions (modified only for `run_command_in_background` usage) ---
+# --- Original functions (only minor adjustments for print statements) ---
 
 def parse_modelfile(filename):
     """
@@ -354,7 +446,7 @@ def run_command(executable, args):
     """
     command = [executable] + args
     
-    print(f"\nExecuting: {' '.join(shlex.quote(arg) for arg in command)}")
+    print(f"\nExecuting: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
 
     try:
         process = subprocess.Popen(command)
@@ -385,7 +477,7 @@ def download_from_ollama(model_id):
         return output_filename
 
     manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{tag}"
-    print(f"Fetching manifest from: {manifest_url}")
+    print(f"Fetching manifest from: {manifest_url}", file=sys.stderr)
 
     try:
         req = urllib.request.Request(manifest_url, headers={
@@ -411,7 +503,7 @@ def download_from_ollama(model_id):
             
             if found_manifest_digest:
                 sub_manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{found_manifest_digest}"
-                print(f"Fetching specific manifest for model from: {sub_manifest_url}")
+                print(f"Fetching specific manifest for model from: {sub_manifest_url}", file=sys.stderr)
                 req = urllib.request.Request(sub_manifest_url, headers={
                     "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
                 })
@@ -449,8 +541,8 @@ def download_from_ollama(model_id):
             sys.exit(1)
 
         download_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/blobs/{gguf_digest}"
-        print(f"Downloading GGUF from: {download_url}")
-        print(f"Saving to: {output_filename}")
+        print(f"Downloading GGUF from: {download_url}", file=sys.stderr)
+        print(f"Saving to: {output_filename}", file=sys.stderr)
 
         def reporthook(blocknum, blocksize, totalsize):
             readsofar = blocknum * blocksize
@@ -464,7 +556,7 @@ def download_from_ollama(model_id):
                 sys.stdout.flush()
 
         urllib.request.urlretrieve(download_url, output_filename, reporthook=reporthook)
-        print("\nDownload complete! 🎉")
+        print("\nDownload complete! 🎉", file=sys.stderr)
         return output_filename
 
     except urllib.error.HTTPError as e:
@@ -487,16 +579,16 @@ def download_from_ollama(model_id):
 def main():
     """
     Main function to parse command-line arguments and dispatch to the correct handler.
-    The 'serve' command now exclusively uses the auto-router with random ports for models.
+    The 'serve' command now exclusively uses the auto-router with on-demand model loading.
     """
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile")
-        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file")
-        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face")
-        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]")
-        print("     - Starts one or more llama-server instances on random ports, with an auto-router on port 11337.")
-        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')")
+        print("Usage:", file=sys.stderr)
+        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile", file=sys.stderr)
+        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file", file=sys.stderr)
+        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face", file=sys.stderr)
+        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
+        print("     - Starts the auto-router on port 11337 and registers models for on-demand loading.", file=sys.stderr)
+        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')", file=sys.stderr)
         sys.exit(1)
 
     command = sys.argv[1].lower()
@@ -525,10 +617,7 @@ def main():
             print("Usage: python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
             sys.exit(1)
         
-        # Start the router first
-        run_router()
-
-        # Start each model server on a random port
+        # Register models, but don't start them yet
         for model_arg in sys.argv[2:]:
             if '=' not in model_arg:
                 print(f"Invalid argument format: '{model_arg}'. Expected <model_name>=<gguf_file>", file=sys.stderr)
@@ -536,31 +625,37 @@ def main():
             model_name, gguf_file = model_arg.split('=', 1)
             
             if not os.path.exists(gguf_file):
-                print(f"Error: Model file '{gguf_file}' not found. Skipping.", file=sys.stderr)
+                print(f"Error: Model file '{gguf_file}' not found. Skipping registration.", file=sys.stderr)
                 continue
             
-            # Find a free port and start the server
-            port = find_free_port()
-            run_command_in_background(
-                "llama-server", 
-                ["-m", shlex.quote(gguf_file), "--port", str(port), "--host", "localhost"], # Explicitly bind to localhost
-                model_name,
-                port
-            )
+            registered_models[model_name] = {'gguf_path': gguf_file}
+            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         
-        # Keep the main thread alive so the background servers and router can run
+        if not registered_models:
+            print("No models registered. Router will not serve any models.", file=sys.stderr)
+            sys.exit(1)
+
+        # Start the router
+        run_router()
+
+        # Keep the main thread alive so the background router thread and on-demand model processes can run
         try:
-            # Using Event().wait() is often better for actual applications, but a simple loop
-            # with sleep is sufficient to keep the main thread alive for this purpose.
             while True:
-                time.sleep(1) 
+                # Periodically clean up processes that have died
+                for name, info in list(registered_models.items()): # Use list() to allow modification during iteration
+                    if 'process' in info and info['process'].poll() is not None:
+                        print(f"Info: Model '{name}' server (PID {info['process'].pid}) has terminated.", file=sys.stderr)
+                        # Remove process and port info, keep gguf_path for potential re-activation
+                        del registered_models[name]['process']
+                        if 'port' in registered_models[name]: del registered_models[name]['port']
+                time.sleep(5) # Check every 5 seconds
         except KeyboardInterrupt:
-            print("\nShutting down all servers...")
+            print("\nShutting down all servers...", file=sys.stderr)
             # Terminate all running processes
-            for info in running_models.values():
-                if info['process'].poll() is None: # Check if still running before trying to terminate
+            for info in registered_models.values():
+                if 'process' in info and info['process'].poll() is None: # Check if still running before trying to terminate
                     info['process'].terminate()
-            print("All services stopped. Goodbye! 👋")
+            print("All services stopped. Goodbye! 👋", file=sys.stderr)
             sys.exit(0)
     elif command == "dl-from-ollama":
         if len(sys.argv) != 3:
