@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sllama-cli"
 version = "0.1.0"
 authors = [
-  { name="Sammy Lord", email="python.projects@sllord.info" },
+    { name="Sammy Lord", email="python.projects@sllord.info" },
 ]
 description = "A simple frontend for llama.cpp CLI, similar to Ollama."
 readme = "README.md"
@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+dependencies=['requests']
 
 [project.scripts]
-sllama = "sllama:main" # This defines the console script here as well
-
+sllama = "sllama:main"

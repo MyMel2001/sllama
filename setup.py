@@ -30,6 +30,6 @@ setup(
     python_requires='>=3.7', # Minimum Python version required
     # No external dependencies are needed for sllama.py itself,
     # so install_requires is empty or omitted.
-    # install_requires=[],
+    install_requires=['requests'],
 )
 
