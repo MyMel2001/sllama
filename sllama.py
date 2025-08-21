@@ -550,7 +550,7 @@ def download_from_ollama(model_id):
             for m in manifest.get('manifests', []):
                 if m.get('mediaType') == "application/vnd.ollama.image.manifest.v1+json" or \
                    m.get('mediaType') == "application/vnd.docker.distribution.manifest.v2+json" or \
-                   m.get('mediaType'] == "application/vnd.oci.image.manifest.v1+json"):
+                   m.get('mediaType') == "application/vnd.oci.image.manifest.v1+json"):
                     found_manifest_digest = m.get('digest')
                     break
             
