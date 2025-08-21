@@ -9,29 +9,31 @@ import threading
 import http.server
 from urllib.parse import urlparse
 import requests
-import time # For exponential backoff
+import time
+from subprocess import DEVNULL # Import DEVNULL from subprocess for cross-platform compatibility
 
 # Dictionary to store information about running llama-server processes
-# Keys are model names, values are dictionaries with 'port' and 'process'
+# Keys are model names (e.g., "deepseek-r1.gguf"), values are dictionaries with 'port' and 'process'
 running_models = {}
 
 def find_free_port():
-    """Finds a free port on the system by binding to a random port."""
+    """Finds a free port on the system by binding to a random ephemeral port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
+        s.bind(('', 0)) # Bind to port 0 to let the OS choose a free port
+        return s.getsockname()[1] # Return the chosen port number
 
 def run_command_in_background(executable, args, name, port):
     """
-    Executes an external command in the background without waiting.
-    Stores the process object for later management.
+    Executes an external command (like llama-server) in the background.
+    It stores the process object in 'running_models' for later management.
+    Stdout and stderr are redirected to DEVNULL to prevent terminal output clutter.
     """
     command = [executable] + args
     print(f"\nExecuting '{name}' in background: {' '.join(shlex.quote(arg) for arg in command)}")
     try:
-        # Use Popen to run the command asynchronously
-        # Redirect stdout and stderr to DEVNULL to prevent blocking
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Popen runs the command asynchronously.
+        # stdout and stderr are redirected to subprocess.DEVNULL for clean output.
+        process = subprocess.Popen(command, stdout=DEVNULL, stderr=DEVNULL)
         running_models[name] = {'port': port, 'process': process}
         print(f"Server for '{name}' started on port {port} with PID {process.pid}.")
     except FileNotFoundError:
@@ -43,149 +45,221 @@ def run_command_in_background(executable, args, name, port):
         sys.exit(1)
 
 def is_port_in_use(port):
-    """Check if a port is currently in use."""
+    """Checks if a given TCP port is currently in use on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind(('localhost', port))
-            return False # Port is free
+            s.bind(('localhost', port)) # Try to bind to the port
+            return False # If successful, port is free
         except OSError:
-            return True # Port is in use
+            return True # If binding fails, port is in use
 
 class LlamaRouter(http.server.BaseHTTPRequestHandler):
     """
-    A simple reverse proxy that routes requests to the correct llama-server instance,
-    following a semi-OpenAI compatible standard for routing.
+    A reverse proxy that routes incoming HTTP requests to the correct
+    llama-server instance, supporting both OpenAI-like API calls
+    (model in JSON body or specific /v1/models paths) and custom routing
+    (model name as first path segment).
     """
-    def do_GET(self):
-        # OpenAI compatible /v1/models endpoint
-        if self.path.startswith("/v1/models"):
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            models_data = []
-            for name, info in running_models.items():
-                # Check if the process is still running
-                if info['process'].poll() is None:
-                    models_data.append({
-                        "id": name,
-                        "object": "model",
-                        "created": int(time.time()), # Mock creation time
-                        "owned_by": "local",
-                        "permission": [
-                            {"id": f"model-perm-{name}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
-                        ],
-                        "root": name,
-                        "parent": None
-                    })
-            
-            response_payload = {
-                "object": "list",
-                "data": models_data
-            }
-            self.wfile.write(json.dumps(response_payload).encode('utf-8'))
-            return
 
-        # Handle other GET requests by routing based on the URL path
-        self.handle_proxy_request(method='GET')
-
-    def do_POST(self):
-        # Handle POST requests by routing based on the URL path
-        self.handle_proxy_request(method='POST')
-
-    def handle_proxy_request(self, method):
-        # Parse the requested path to get the model name for routing
-        parsed_path = urlparse(self.path)
-        path_segments = parsed_path.path.strip('/').split('/')
-
-        model_name = None
-        remaining_path = ""
-
-        # Determine the model name for routing based on the URL structure
-        # Example: /deepseek-r1.gguf/v1/chat/completions -> model_name = "deepseek-r1.gguf", remaining_path = "/v1/chat/completions"
-        if len(path_segments) >= 1 and path_segments[0]:
-            model_name = path_segments[0]
-            remaining_path = '/' + '/'.join(path_segments[1:])
-        
-        if not model_name or model_name not in running_models:
-            self.send_error(404, f"Model '{model_name}' not found or not running. "
-                                 f"Available models: {', '.join(running_models.keys())}")
+    def _forward_request(self, method, model_name, forwarded_path, body=None):
+        """
+        Helper method to forward an HTTP request to a target URL with
+        exponential backoff for retries.
+        model_name: The identified name of the model (e.g., "deepseek-r1.gguf")
+        forwarded_path: The path to send to the backend llama-server (e.g., "/v1/chat/completions")
+        """
+        if model_name not in running_models:
+            self.send_error(404, f"Model '{model_name}' not found or not running.")
             return
 
         target_port = running_models[model_name]['port']
+        # Construct the target URL using the backend's port and the rewritten path
+        target_url = f"http://localhost:{target_port}{forwarded_path}"
         
-        # Construct the target URL for the llama-server
-        # The prompt specifies forwarding the original request path to the specific server.
-        # So, if request is /model_name/v1/chat/completions, the backend server gets /model_name/v1/chat/completions
-        target_url = f"http://localhost:{target_port}{parsed_path.path}"
-        if parsed_path.query:
-            target_url += f"?{parsed_path.query}"
-        
-        print(f"Routing {method} request for model '{model_name}' to {target_url}")
+        # Preserve original query parameters
+        parsed_original_path = urlparse(self.path)
+        if parsed_original_path.query:
+            target_url += f"?{parsed_original_path.query}"
 
-        try:
-            # Prepare headers for forwarding
-            headers = dict(self.headers)
-            # Ensure the Host header reflects the target server, not the router
-            headers['Host'] = f"localhost:{target_port}"
+        print(f"Routing {method} request for model '{model_name}' to backend: {target_url}")
+
+        retries = 3
+        backoff_factor = 0.5 # Initial delay in seconds
+
+        for i in range(retries):
+            try:
+                # Prepare headers for forwarding.
+                # Important: Set 'Host' header to the actual target server's host:port
+                # so the backend server receives the correct Host.
+                headers = dict(self.headers)
+                headers['Host'] = f"localhost:{target_port}"
+                
+                # Make the request to the backend llama-server
+                response = requests.request(
+                    method,
+                    target_url,
+                    headers=headers,
+                    data=body,
+                    stream=True, # Use stream=True to handle large responses efficiently
+                    timeout=600 # Long timeout for LLM inference
+                )
+                break # Request successful, exit retry loop
+            except requests.exceptions.ConnectionError as e:
+                # Handle connection errors (e.g., backend server not ready)
+                print(f"Connection error to {target_url}: {e}. Retrying in {backoff_factor * (2 ** i):.1f} seconds...", file=sys.stderr)
+                time.sleep(backoff_factor * (2 ** i)) # Exponential backoff
+            except requests.exceptions.Timeout as e:
+                # Handle timeouts
+                print(f"Timeout connecting to {target_url}: {e}. Retrying...", file=sys.stderr)
+                time.sleep(backoff_factor * (2 ** i)) # Exponential backoff
+        else:
+            # All retries failed
+            self.send_error(504, f"Failed to connect to model server after {retries} retries.")
+            return
+
+        # Forward the response from the backend server back to the original client
+        self.send_response(response.status_code)
+        for key, value in response.headers.items():
+            # Avoid forwarding hop-by-hop headers that are handled by proxies themselves
+            if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade']:
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(response.content) # Write the response content (bytes)
+
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        path_segments = parsed_path.path.strip('/').split('/')
+
+        # Case 1: OpenAI-standard /v1/models endpoint
+        # Example: GET http://localhost:11337/v1/models
+        # Example: GET http://localhost:11337/v1/models/model_id
+        if path_segments and path_segments[0] == "v1" and len(path_segments) >= 2 and path_segments[1] == "models":
+            # If it's /v1/models or /v1/models/ (list models)
+            if len(path_segments) == 2 or (len(path_segments) == 3 and not path_segments[2]):
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                models_data = []
+                for name, info in running_models.items():
+                    if info['process'].poll() is None: # Check if the backend process is still running
+                        models_data.append({
+                            "id": name,
+                            "object": "model",
+                            "created": int(time.time()), # Mock creation time
+                            "owned_by": "local",
+                            "permission": [
+                                {"id": f"model-perm-{name}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
+                            ],
+                            "root": name,
+                            "parent": None
+                        })
+                
+                response_payload = {
+                    "object": "list",
+                    "data": models_data
+                }
+                self.wfile.write(json.dumps(response_payload).encode('utf-8'))
+                return
+            # If it's /v1/models/<model_id>
+            elif len(path_segments) >= 3:
+                model_id_from_path = path_segments[2]
+                if model_id_from_path in running_models:
+                    # Forward exactly '/v1/models/<model_id>' to the backend
+                    forwarded_path = f"/v1/models/{model_id_from_path}"
+                    self._forward_request(method='GET', model_name=model_id_from_path, forwarded_path=forwarded_path)
+                    return
+                else:
+                    self.send_error(404, f"Model '{model_id_from_path}' not found or not running.")
+                    return
+        
+        # Case 2: Custom Routing - model name as first path segment
+        # Example: GET http://localhost:11337/deepseek-r1.gguf/v1/chat/completions
+        if path_segments and path_segments[0] in running_models:
+            model_name_from_path = path_segments[0]
+            # Rewrite path: remove the model name segment for the backend server
+            forwarded_path = '/' + '/'.join(path_segments[1:])
+            # Ensure the forwarded path starts with /
+            if not forwarded_path.startswith('/'):
+                forwarded_path = '/' + forwarded_path
             
-            # Read the request body for POST requests
-            body = None
-            if method == 'POST':
-                content_length = int(headers.get('Content-Length', 0))
-                body = self.rfile.read(content_length)
+            self._forward_request(method='GET', model_name=model_name_from_path, forwarded_path=forwarded_path)
+            return
 
-            # Use exponential backoff for retries
-            retries = 3
-            backoff_factor = 0.5
-            for i in range(retries):
-                try:
-                    response = requests.request(
-                        method,
-                        target_url,
-                        headers=headers,
-                        data=body,
-                        stream=True, # Stream response to handle large bodies
-                        timeout=600 # Increased timeout for LLM responses
-                    )
-                    break # Success, exit retry loop
-                except requests.exceptions.ConnectionError as e:
-                    print(f"Connection error to {target_url}: {e}. Retrying in {backoff_factor * (2 ** i)} seconds...", file=sys.stderr)
-                    time.sleep(backoff_factor * (2 ** i))
-                except requests.exceptions.Timeout as e:
-                    print(f"Timeout connecting to {target_url}: {e}. Retrying...", file=sys.stderr)
-                    time.sleep(backoff_factor * (2 ** i))
-            else:
-                self.send_error(504, f"Failed to connect to model server after {retries} retries.")
+        # If neither standard OpenAI nor custom path routing matches
+        self.send_error(404, "Unsupported GET endpoint or model not found.")
+
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        path_segments = parsed_path.path.strip('/').split('/')
+        
+        body = None
+        request_payload = {}
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                body = self.rfile.read(content_length)
+                request_payload = json.loads(body.decode('utf-8'))
+        except (ValueError, json.JSONDecodeError) as e:
+            self.send_error(400, f"Invalid JSON in request body: {e}")
+            return
+        except Exception as e:
+            print(f"Warning: Could not read or decode POST body: {e}", file=sys.stderr)
+            pass 
+
+        # Case 1: OpenAI-standard POST endpoints (e.g., /v1/chat/completions, /v1/completions)
+        # Model name is expected in the JSON body
+        # Example: POST http://localhost:11337/v1/chat/completions (model in body)
+        if path_segments and path_segments[0] == "v1" and len(path_segments) >= 2 and \
+           path_segments[1] in ["chat", "completions"]: # Covers /v1/chat/completions and /v1/completions
+            
+            model_name_from_body = request_payload.get("model")
+
+            if not model_name_from_body:
+                self.send_error(400, "For /v1/chat/completions or /v1/completions, the 'model' field is required in the JSON body.")
                 return
 
-            # Forward the response back to the client
-            self.send_response(response.status_code)
-            for key, value in response.headers.items():
-                # Avoid forwarding hop-by-hop headers that are handled by proxies
-                if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade']:
-                    self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(response.content) # Use .content to get bytes
+            if model_name_from_body not in running_models:
+                self.send_error(404, f"Model '{model_name_from_body}' not found or not running. "
+                                     f"Available models: {', '.join(running_models.keys())}")
+                return
 
-        except requests.exceptions.RequestException as e:
-            self.send_error(502, f"Failed to forward request to model server: {e}")
-        except Exception as e:
-            self.send_error(500, f"An internal error occurred: {e}")
+            # Forward the exact OpenAI-standard path to the backend
+            forwarded_path = parsed_path.path # e.g., /v1/chat/completions
+            self._forward_request(method='POST', model_name=model_name_from_body, forwarded_path=forwarded_path, body=body)
+            return
+        
+        # Case 2: Custom Routing - model name as first path segment for POST requests
+        # Example: POST http://localhost:11337/deepseek-r1.gguf/v1/chat/completions
+        if path_segments and path_segments[0] in running_models:
+            model_name_from_path = path_segments[0]
+            # Rewrite path: remove the model name segment for the backend server
+            forwarded_path = '/' + '/'.join(path_segments[1:])
+            # Ensure the forwarded path starts with /
+            if not forwarded_path.startswith('/'):
+                forwarded_path = '/' + forwarded_path
+            
+            self._forward_request(method='POST', model_name=model_name_from_path, forwarded_path=forwarded_path, body=body)
+            return
+
+        # If neither standard OpenAI nor custom path routing matches
+        self.send_error(404, "Unsupported POST endpoint or model not specified/found.")
+
 
 def run_router():
-    """Starts the auto-router on the specified port."""
+    """Starts the auto-router on the specified fixed port (11337)."""
     router_port = 11337
     if is_port_in_use(router_port):
         print(f"Router is already running on port {router_port}. Skipping starting a new one.")
         return
 
     print(f"Starting auto-router on port {router_port}...")
-    server_address = ('', router_port)
-    # Using ThreadingHTTPServer for better concurrency if multiple clients connect
+    server_address = ('0.0.0.0', router_port)
+    # Use ThreadingHTTPServer for better concurrency when handling multiple client requests
     httpd = http.server.ThreadingHTTPServer(server_address, LlamaRouter)
     router_thread = threading.Thread(target=httpd.serve_forever)
-    router_thread.daemon = True # Allow the main thread to exit if Ctrl+C is pressed
+    router_thread.daemon = True # Allows the main thread to exit, which will also terminate this thread
     router_thread.start()
     print(f"Auto-router started on http://localhost:{router_port}. Press Ctrl+C to stop all services.")
 
@@ -386,7 +460,7 @@ def download_from_ollama(model_id):
                 sys.stdout.flush()
 
         urllib.request.urlretrieve(download_url, output_filename, reporthook=reporthook)
-        print("\nDownload complete! 🎉")
+        print("\nDownload complete! �")
         return output_filename
 
     except urllib.error.HTTPError as e:
@@ -472,15 +546,15 @@ def main():
         
         # Keep the main thread alive so the background servers and router can run
         try:
-            # Use a long sleep or a continuous loop to keep the main thread alive
-            # while background threads and processes run.
+            # Using Event().wait() is often better for actual applications, but a simple loop
+            # with sleep is sufficient to keep the main thread alive for this purpose.
             while True:
                 time.sleep(1) 
         except KeyboardInterrupt:
             print("\nShutting down all servers...")
             # Terminate all running processes
             for info in running_models.values():
-                if info['process'].poll() is None: # Check if still running
+                if info['process'].poll() is None: # Check if still running before trying to terminate
                     info['process'].terminate()
             print("All services stopped. Goodbye! 👋")
             sys.exit(0)
