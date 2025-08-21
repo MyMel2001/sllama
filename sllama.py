@@ -44,11 +44,12 @@ def run_command_in_background(executable, args, name, port):
         print(f"\nAn unexpected error occurred while trying to run {executable}: {e}", file=sys.stderr)
         sys.exit(1)
 
-def is_port_in_use(port):
-    """Checks if a given TCP port is currently in use on localhost."""
+def is_port_in_use(port, host='127.0.0.1'): # Check localhost for existing listeners
+    """Checks if a given TCP port is currently in use on a specified host."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind(('localhost', port)) # Try to bind to the port
+            s.bind((host, port)) # Try to bind to the port
+            s.close() # Release the port immediately
             return False # If successful, port is free
         except OSError:
             return True # If binding fails, port is in use
@@ -74,6 +75,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
 
         target_port = running_models[model_name]['port']
         # Construct the target URL using the backend's port and the rewritten path
+        # Backend llama-server instances are still bound to localhost for security/isolation
         target_url = f"http://localhost:{target_port}{forwarded_path}"
         
         # Preserve original query parameters
@@ -131,8 +133,8 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         path_segments = parsed_path.path.strip('/').split('/')
 
         # Case 1: OpenAI-standard /v1/models endpoint
-        # Example: GET http://localhost:11337/v1/models
-        # Example: GET http://localhost:11337/v1/models/model_id
+        # Example: GET http://<router_ip>:11337/v1/models
+        # Example: GET http://<router_ip>:11337/v1/models/model_id
         if path_segments and path_segments[0] == "v1" and len(path_segments) >= 2 and path_segments[1] == "models":
             # If it's /v1/models or /v1/models/ (list models)
             if len(path_segments) == 2 or (len(path_segments) == 3 and not path_segments[2]):
@@ -174,7 +176,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                     return
         
         # Case 2: Custom Routing - model name as first path segment
-        # Example: GET http://localhost:11337/deepseek-r1.gguf/v1/chat/completions
+        # Example: GET http://<router_ip>:11337/deepseek-r1.gguf/v1/chat/completions
         if path_segments and path_segments[0] in running_models:
             model_name_from_path = path_segments[0]
             # Rewrite path: remove the model name segment for the backend server
@@ -210,7 +212,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
 
         # Case 1: OpenAI-standard POST endpoints (e.g., /v1/chat/completions, /v1/completions)
         # Model name is expected in the JSON body
-        # Example: POST http://localhost:11337/v1/chat/completions (model in body)
+        # Example: POST http://<router_ip>:11337/v1/chat/completions (model in body)
         if path_segments and path_segments[0] == "v1" and len(path_segments) >= 2 and \
            path_segments[1] in ["chat", "completions"]: # Covers /v1/chat/completions and /v1/completions
             
@@ -231,7 +233,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
             return
         
         # Case 2: Custom Routing - model name as first path segment for POST requests
-        # Example: POST http://localhost:11337/deepseek-r1.gguf/v1/chat/completions
+        # Example: POST http://<router_ip>:11337/deepseek-r1.gguf/v1/chat/completions
         if path_segments and path_segments[0] in running_models:
             model_name_from_path = path_segments[0]
             # Rewrite path: remove the model name segment for the backend server
@@ -250,18 +252,20 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
 def run_router():
     """Starts the auto-router on the specified fixed port (11337)."""
     router_port = 11337
-    if is_port_in_use(router_port):
+    # Explicitly try to bind to '0.0.0.0' to check if the port is in use globally
+    if is_port_in_use(router_port, host='0.0.0.0'): 
         print(f"Router is already running on port {router_port}. Skipping starting a new one.")
         return
 
     print(f"Starting auto-router on port {router_port}...")
-    server_address = ('0.0.0.0', router_port)
+    # Bind the server to '0.0.0.0' to listen on all available network interfaces
+    server_address = ('0.0.0.0', router_port) 
     # Use ThreadingHTTPServer for better concurrency when handling multiple client requests
     httpd = http.server.ThreadingHTTPServer(server_address, LlamaRouter)
     router_thread = threading.Thread(target=httpd.serve_forever)
     router_thread.daemon = True # Allows the main thread to exit, which will also terminate this thread
     router_thread.start()
-    print(f"Auto-router started on http://localhost:{router_port}. Press Ctrl+C to stop all services.")
+    print(f"Auto-router started on http://0.0.0.0:{router_port}. This means it's accessible from any IP address on your network. Check your firewall if issues occur. Press Ctrl+C to stop all services.")
 
 # --- Original functions (modified only for `run_command_in_background` usage) ---
 
@@ -460,7 +464,7 @@ def download_from_ollama(model_id):
                 sys.stdout.flush()
 
         urllib.request.urlretrieve(download_url, output_filename, reporthook=reporthook)
-        print("\nDownload complete! �")
+        print("\nDownload complete! 🎉")
         return output_filename
 
     except urllib.error.HTTPError as e:
