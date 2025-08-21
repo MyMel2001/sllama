@@ -13,7 +13,6 @@ This project was created out of a personal need for an Ollama-like interface tha
 * **Hugging Face Integration**: Run models directly from Hugging Face repositories.
 * **Built-in Server**: Launch a `llama.cpp` HTTP server (`llama-server`) for API access to your models.
 * **Ollama Registry Download**: Download GGUF models directly from Ollama's public model registry without needing the Ollama application.
-* **No External Python Dependencies**: Built purely with Python's standard library, ensuring minimal overhead and broad compatibility.
 
 ## Installation
 
@@ -86,7 +85,7 @@ To start an HTTP API server for a GGUF model (runs on port 11337 to avoid confli
 
 ```sllama serve my_api_model.gguf```
 
-This will run llama-server -m my_api_model.gguf --port 11337.
+This will run one or more instances of ```llama-server``` on random ports with a router on port 11337.
 
 5. Downloading from Ollama Registry (dl-from-ollama)
 Download GGUF models directly from Ollama's public registry. If no tag is specified, it defaults to latest. The file will be saved in your current directory.
