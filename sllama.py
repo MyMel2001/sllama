@@ -75,7 +75,7 @@ def wait_for_server_ready(port, model_name, timeout=600): # Increased default ti
     # Second, attempt a dummy chat completion request to verify model loading
     chat_url = f"http://localhost:{port}/v1/chat/completions"
     dummy_payload = {
-        "model": model_name, # Use the actual model name as expected by llama-server
+        "model": model_name, # Correctly using model_name here
         "messages": [{"role": "user", "content": "hi"}]
     }
     headers = {"Content-Type": "application/json"}
