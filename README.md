@@ -104,4 +104,4 @@ sllama dl-from-ollama llama2
 
 ## License
 
-This project is open-source and distributed under the MIT License. See the LICENSE file for details.
+This project is open-source and distributed under the SPL-R5 License. See the LICENSE file for details.
