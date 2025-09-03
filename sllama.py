@@ -392,10 +392,83 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         self.send_error(404, "Unsupported POST endpoint or model not specified/found.")
 
 
+# New helper: parse a modelfile and return a list of (registered_name, gguf_path) pairs
+def register_models_from_modelfile(modelfile_path):
+    """
+    Parses a Modelfile-like text file and returns a list of (name, path_to_gguf) tuples
+    suitable for registering into the in-process router as on-demand load targets.
+
+    Modelfile format supported:
+    - FROM <path_or_id>: If local path, uses that as gguf_path; if not, skip (no HF resolve here)
+    - PARAMETER <key> <value>: Attach as extra arg for the current modelfile-derived model
+    - SYSTEM \"\"\"<text>\"\"\": Attach as -sys \"<text>\"
+    - Other commands are ignored for registration purposes
+    """
+    models = []
+    dir_of_file = os.path.dirname(modelfile_path)
+    base_name = os.path.basename(modelfile_path)
+    current_model = None
+    try:
+        with open(modelfile_path, 'r') as f:
+            idx = 0
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                upper = line.upper()
+                if upper.startswith("FROM"):
+                    value = line[4:].strip()
+                    gguf_candidate = value
+                    # Resolve relative paths against the modelfile directory
+                    if not os.path.isabs(gguf_candidate):
+                        gguf_candidate = os.path.join(dir_of_file, gguf_candidate)
+                    if os.path.exists(gguf_candidate) and os.path.isfile(gguf_candidate):
+                        name = f"{base_name}_{idx}"
+                        models.append((name, gguf_candidate))
+                        # initialize extras container for this model
+                        registered_models.setdefault(name, {'gguf_path': gguf_candidate, 'extra_args': []})
+                        current_model = name
+                        idx += 1
+                    else:
+                        print(f"Warning: Modelfile '{modelfile_path}': referenced GGUF not found: {gguf_candidate}", file=sys.stderr)
+                elif upper.startswith("PARAMETER"):
+                    if current_model is None:
+                        print(f"Warning: Modelfile '{modelfile_path}': PARAMETER line while no model context: '{line}'", file=sys.stderr)
+                        continue
+                    param_parts = line.split(None, 2)
+                    if len(param_parts) >= 3:
+                        param_key = param_parts[1]
+                        param_value = param_parts[2]
+                        registered_models[current_model].setdefault('extra_args', []).extend([f"--{param_key}", str(param_value)])
+                    else:
+                        print(f"Warning: Modelfile '{modelfile_path}': Malformed PARAMETER line: '{line}'", file=sys.stderr)
+                elif upper.startswith("SYSTEM"):
+                    if current_model is None:
+                        print(f"Warning: Modelfile '{modelfile_path}': SYSTEM line with no model context: '{line}'", file=sys.stderr)
+                        continue
+                    inner = line[6:].strip()
+                    # Remove triple quotes wrappers if present
+                    if inner.startswith('"""') and inner.endswith('"""'):
+                        inner = inner[3:-3]
+                    elif inner.startswith('"') and inner.endswith('"'):
+                        inner = inner[1:-1]
+                    if inner:
+                        registered_models[current_model].setdefault('extra_args', []).extend(['-sys', inner])
+                else:
+                    print(f"Warning: Modelfile '{modelfile_path}': Unrecognized command: '{line}'", file=sys.stderr)
+        return models
+    except FileNotFoundError:
+        print(f"Error: Modelfile '{modelfile_path}' not found.", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Error parsing Modelfile '{modelfile_path}': {e}", file=sys.stderr)
+        return []
+
+
 def run_router():
     """Starts the auto-router on the specified fixed port (11337)."""
     router_port = 11337
-    # Explicitly try to bind to '0.0.0.0' to check if the port is in use globally
+    # Explicitly try to bind to '0.0.0.0' to check if the port is use globally
     if is_port_in_use(router_port, host='0.0.0.0'): 
         print(f"Router is already running on port {router_port}. Skipping starting a new one.", file=sys.stderr)
         return
@@ -411,221 +484,6 @@ def run_router():
     print(f"Auto-router started on http://0.0.0.0:{router_port}. This means it's accessible from any IP address on your network. Check your firewall if issues occur. Press Ctrl+C to stop all services.", file=sys.stderr)
 
 # --- Original functions (only minor adjustments for print statements) ---
-
-def parse_modelfile(filename):
-    """
-    Parses a Modelfile-like text file and returns a list of arguments
-    suitable for passing to llama-cli.
-    Supports:
-    - FROM <model_id_or_path>: Maps to -m <path> if local file, -hf <id> if Hugging Face ID.
-    - PARAMETER <key> <value>: Maps to -<key> <value>
-    - SYSTEM \"\"\"<text>\"\"\": Maps to -sys "<text>" (supports multi-line)
-    """
-    llama_args = []
-    in_system_block = False
-    system_prompt_lines = []
-
-    try:
-        with open(filename, 'r') as f:
-            for line_num, line in enumerate(f, 1):
-                stripped_line = line.strip()
-
-                if in_system_block:
-                    if stripped_line == '"""':
-                        in_system_block = False
-                        system_prompt = " ".join(system_prompt_lines).strip()
-                        if system_prompt:
-                            llama_args.extend(["-sys", shlex.quote(system_prompt)])
-                        system_prompt_lines = []
-                    else:
-                        system_prompt_lines.append(line.rstrip('\n'))
-                    continue
-
-                if not stripped_line:
-                    continue
-
-                parts = stripped_line.split(maxsplit=1)
-
-                command = parts[0].upper()
-                value = parts[1] if len(parts) > 1 else ""
-
-                if command == "FROM":
-                    if os.path.exists(value) and os.path.isfile(value):
-                        print(f"Detected local GGUF file: {value}", file=sys.stderr)
-                        llama_args.extend(["-m", shlex.quote(value)])
-                    else:
-                        print(f"Assuming Hugging Face model ID: {value}", file=sys.stderr)
-                        llama_args.extend(["-hf", shlex.quote(value)])
-                elif command == "PARAMETER":
-                    param_parts = value.split(maxsplit=1)
-                    if len(param_parts) == 2:
-                        param_key = param_parts[0]
-                        param_value = param_parts[1]
-                        llama_args.extend([f"--{param_key}", shlex.quote(param_value)])
-                    else:
-                        print(f"Warning: Modelfile '{filename}' line {line_num}: Malformed PARAMETER line: '{stripped_line}'", file=sys.stderr)
-                elif command == "SYSTEM":
-                    if value.startswith('"""'):
-                        if len(value) > 3:
-                            system_prompt_lines.append(value[3:].strip())
-                        in_system_block = True
-                    else:
-                        llama_args.extend(["-sys", shlex.quote(value.strip())])
-                else:
-                    print(f"Warning: Modelfile '{filename}' line {line_num}: Unrecognized command: '{stripped_line}'", file=sys.stderr)
-
-            if in_system_block and system_prompt_lines:
-                print(f"Warning: Modelfile '{filename}': SYSTEM block not closed with '\"\"\"'. Consuming till EOF.", file=sys.stderr)
-                system_prompt = "\n".join(system_prompt_lines).strip()
-                if system_prompt:
-                    llama_args.extend(["-sys", shlex.quote(system_prompt)])
-
-    except FileNotFoundError:
-        print(f"Error: Modelfile '{filename}' not found. Please check the path.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error parsing Modelfile '{filename}': {e}", file=sys.stderr)
-        sys.exit(1)
-
-    return llama_args
-
-def run_command(executable, args):
-    """
-    Executes an external command with the given arguments.
-    Prints the command being executed and handles common errors.
-    This function is for synchronous, blocking commands (e.g., llama-cli).
-    """
-    command = [executable] + args
-    
-    print(f"\nExecuting: {' '.join(shlex.quote(arg) for arg in command)}", file=sys.stderr)
-
-    try:
-        process = subprocess.Popen(command)
-        process.wait() # Wait for the process to complete or be interrupted
-        if process.returncode != 0:
-            print(f"\nError: Command '{executable}' failed with exit status {process.returncode}.", file=sys.stderr)
-            sys.exit(process.returncode)
-    except FileNotFoundError:
-        print(f"\nError: '{executable}' command not found.", file=sys.stderr)
-        print(f"Please ensure '{executable}' is installed and in your system's PATH.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nAn unexpected error occurred while trying to run {executable}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-def download_from_ollama(model_id):
-    """
-    Downloads a GGUF model from Ollama's public registry using the OCI Distribution Spec API.
-    Prioritizes layers with mediaType 'application/vnd.ollama.image.model'.
-    """
-    model_name_base, tag = (model_id.split(':', 1) + ['latest'])[:2]
-    
-    safe_model_name_base = model_name_base.replace('/', '_').replace(':', '-')
-    output_filename = f"{safe_model_name_base}-{tag}.gguf"
-
-    if os.path.exists(output_filename):
-        print(f"Model '{output_filename}' already exists. Skipping download.", file=sys.stderr)
-        return output_filename
-
-    manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{tag}"
-    print(f"Fetching manifest from: {manifest_url}", file=sys.stderr)
-
-    try:
-        req = urllib.request.Request(manifest_url, headers={
-            "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
-        })
-        with urllib.request.urlopen(req) as response:
-            if response.getcode() != 200:
-                print(f"Error: Could not fetch manifest from {manifest_url}. Status code: {response.getcode()}", file=sys.stderr)
-                sys.exit(1)
-            manifest = json.loads(response.read().decode('utf-8'))
-
-        gguf_digest = None
-        
-        # Handle manifest lists (image index) first
-        if manifest.get('mediaType') in ("application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json"):
-            found_manifest_digest = None
-            for m in manifest.get('manifests', []):
-                if m.get('mediaType') == "application/vnd.ollama.image.manifest.v1+json" or \
-                   m.get('mediaType') == "application/vnd.docker.distribution.manifest.v2+json" or \
-                   m.get('mediaType') == "application/vnd.oci.image.manifest.v1+json":
-                    found_manifest_digest = m.get('digest')
-                    break
-            
-            if found_manifest_digest:
-                sub_manifest_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/manifests/{found_manifest_digest}"
-                print(f"Fetching specific manifest for model from: {sub_manifest_url}", file=sys.stderr)
-                req = urllib.request.Request(sub_manifest_url, headers={
-                    "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
-                })
-                with urllib.request.urlopen(req) as sub_response:
-                    if sub_response.getcode() != 200:
-                        print(f"Error: Could not fetch sub-manifest from {sub_manifest_url}. Status code: {sub_response.getcode()}", file=sys.stderr)
-                        sys.exit(1)
-                    manifest = json.loads(sub_response.read().decode('utf-8'))
-            else:
-                print(f"Warning: No specific image manifest found in manifest list for '{model_name_base}:{tag}'. Trying to find digest in top-level manifest config/layers.", file=sys.stderr)
-
-        # *** REFINED LOGIC FOR GGUF DIGEST IDENTIFICATION ***
-        # Prioritize layers with specific model media types
-        for layer in manifest.get('layers', []):
-            if 'digest' in layer and 'mediaType' in layer:
-                # This media type typically identifies the GGUF file itself
-                if layer['mediaType'] == "application/vnd.ollama.image.model" or \
-                   layer['mediaType'].startswith("application/vnd.ollama.image.model.") or \
-                   layer['mediaType'] == "application/octet-stream": # General binary blob, often used for GGUF
-                    gguf_digest = layer['digest']
-                    print(f"Found GGUF digest in layer with mediaType: {layer['mediaType']}", file=sys.stderr)
-                    break
-        
-        # Fallback: Check config digest if no specific model layer was found
-        if not gguf_digest:
-            config_digest = manifest.get('config', {}).get('digest')
-            if config_digest and config_digest.startswith("sha256:"):
-                gguf_digest = config_digest
-                print("Found GGUF digest in config.", file=sys.stderr)
-        # *** END REFINED LOGIC ***
-
-        if not gguf_digest:
-            print(f"Error: Could not find GGUF model digest in manifest for '{model_name_base}:{tag}'. No suitable layer or config digest found.", file=sys.stderr)
-            print("Please ensure the model ID is correct and its GGUF blob is accessible via the registry API.", file=sys.stderr)
-            sys.exit(1)
-
-        download_url = f"https://registry.ollama.ai/v2/library/{model_name_base}/blobs/{gguf_digest}"
-        print(f"Downloading GGUF from: {download_url}", file=sys.stderr)
-        print(f"Saving to: {output_filename}", file=sys.stderr)
-
-        def reporthook(blocknum, blocksize, totalsize):
-            readsofar = blocknum * blocksize
-            if totalsize > 0:
-                percent = readsofar * 1e2 / totalsize
-                s = f"\rDownloading: {percent:.1f}% ({readsofar / (1024*1024):.2f}MB / {totalsize / (1024*1024):.2f}MB)"
-                sys.stdout.write(s)
-                sys.stdout.flush()
-            else:
-                sys.stdout.write(f"\rDownloading: {readsofar / (1024*1024):.2f}MB downloaded...")
-                sys.stdout.flush()
-
-        urllib.request.urlretrieve(download_url, output_filename, reporthook=reporthook)
-        print("\nDownload complete! 🎉", file=sys.stderr)
-        return output_filename
-
-    except urllib.error.HTTPError as e:
-        print(f"\nHTTP Error during download: {e.code} - {e.reason}", file=sys.stderr)
-        print(f"Error accessing {manifest_url}. This might mean the model or tag isn't directly available via the OCI manifest API or an issue with blob download.", file=sys.stderr)
-        print("Possible reasons: Incorrect model/tag, network issues, or a change in Ollama's registry API for blobs.", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"\nURL Error during download: {e.reason}", file=sys.stderr)
-        print("Check your internet connection or the registry API endpoint.", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print("\nError: Could not decode JSON response. Invalid manifest or API response from Ollama registry?", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nAn unexpected error occurred during download: {e}", file=sys.stderr)
-        sys.exit(1)
-
 
 def main():
     """
@@ -668,19 +526,30 @@ def main():
             print("Usage: python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
             sys.exit(1)
         
-        # Register models, but don't start them yet
+        # Register models, including support for modelfiles
         for model_arg in sys.argv[2:]:
             if '=' not in model_arg:
                 print(f"Invalid argument format: '{model_arg}'. Expected <model_name>=<gguf_file>", file=sys.stderr)
                 continue
             model_name, gguf_file = model_arg.split('=', 1)
             
-            if not os.path.exists(gguf_file):
-                print(f"Error: Model file '{gguf_file}' not found. Skipping registration.", file=sys.stderr)
-                continue
-            
-            registered_models[model_name] = {'gguf_path': gguf_file}
-            print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
+            # Support modelfiles as a directory or single file:
+            if model_name.lower() == "modelfiles" or gguf_file.lower().endswith(".modelfile"):
+                modelfile_path = gguf_file
+                if not os.path.isabs(modelfile_path):
+                    modelfile_path = os.path.join(os.getcwd(), modelfile_path)
+                modelfile_models = register_models_from_modelfile(modelfile_path)
+                if not modelfile_models:
+                    print(f"Warning: No models found in modelfile '{modelfile_path}'.", file=sys.stderr)
+                for mname, mpath in modelfile_models:
+                    registered_models[mname] = {'gguf_path': mpath}
+                    print(f"Model '{mname}' registered from modelfile '{modelfile_path}' for on-demand loading from '{mpath}'.", file=sys.stderr)
+            else:
+                if not os.path.exists(gguf_file):
+                    print(f"Error: Model file '{gguf_file}' not found. Skipping registration.", file=sys.stderr)
+                    continue
+                registered_models[model_name] = {'gguf_path': gguf_file}
+                print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         
         if not registered_models:
             print("No models registered. Router will not serve any models.", file=sys.stderr)
