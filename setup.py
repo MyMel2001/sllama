@@ -12,7 +12,7 @@ setup(
     classifiers=[
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.7', # Specify your Python version
-        'License :: OSI Approved :: MIT License', # Or another appropriate license
+        'License :: SPL-R5 License', # Or another appropriate license
         'Operating System :: OS Independent',
         'Environment :: Console',
         'Intended Audience :: Developers',
