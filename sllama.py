@@ -723,24 +723,53 @@ def main():
                 continue
             model_name, gguf_file = model_arg.split('=', 1)
             
+            # Remove any leading/trailing quotes that might be around the argument string
+            gguf_file = gguf_file.strip('"').strip("'")
+            
+            # --- START OF NEW FOLDER LOGIC ---
+            # Check if the path provided is a directory
+            if os.path.isdir(gguf_file):
+                print(f"Searching directory '{gguf_file}' for modelfiles...", file=sys.stderr)
+                # Loop through all files in the directory
+                for filename in os.listdir(gguf_file):
+                    if filename.endswith(".modelfile"):
+                        modelfile_path = os.path.join(gguf_file, filename)
+                        modelfile_models = register_models_from_modelfile(modelfile_path)
+                        if not modelfile_models:
+                            print(f"Warning: No models found in modelfile '{modelfile_path}'.", file=sys.stderr)
+                        for mname, mpath in modelfile_models:
+                            registered_models[mname] = {'gguf_path': mpath}
+                            print(f"Model '{mname}' registered from modelfile '{modelfile_path}' for on-demand loading from '{mpath}'.", file=sys.stderr)
+                continue # Move to the next command-line argument
+            # --- END OF NEW FOLDER LOGIC ---
+
             # Support modelfiles as a directory or single file:
             if model_name.lower() == "modelfiles" or gguf_file.lower().endswith(".modelfile"):
                 modelfile_path = gguf_file
                 if not os.path.isabs(modelfile_path):
                     modelfile_path = os.path.join(os.getcwd(), modelfile_path)
-                modelfile_models = register_models_from_modelfile(modelfile_path)
-                if not modelfile_models:
-                    print(f"Warning: No models found in modelfile '{modelfile_path}'.", file=sys.stderr)
-                for mname, mpath in modelfile_models:
-                    registered_models[mname] = {'gguf_path': mpath}
-                    print(f"Model '{mname}' registered from modelfile '{modelfile_path}' for on-demand loading from '{mpath}'.", file=sys.stderr)
+
+                # Correctly handle comma-separated lists of modelfiles
+                paths_txt = modelfile_path.strip()
+                model_paths = paths_txt.split(',')
+                for single_modelfile_path in model_paths:
+                    single_modelfile_path = single_modelfile_path.strip()
+                    
+                    if not os.path.isabs(single_modelfile_path):
+                        single_modelfile_path = os.path.join(os.getcwd(), single_modelfile_path)
+                    
+                    modelfile_models = register_models_from_modelfile(single_modelfile_path)
+                    if not modelfile_models:
+                        print(f"Warning: No models found in modelfile '{single_modelfile_path}'.", file=sys.stderr)
+                    for mname, mpath in modelfile_models:
+                        registered_models[mname] = {'gguf_path': mpath}
+                        print(f"Model '{mname}' registered from modelfile '{single_modelfile_path}' for on-demand loading from '{mpath}'.", file=sys.stderr)
             else:
                 if not os.path.exists(gguf_file):
                     print(f"Error: Model file '{gguf_file}' not found. Skipping registration.", file=sys.stderr)
                     continue
                 registered_models[model_name] = {'gguf_path': gguf_file}
                 print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
-        
         if not registered_models:
             print("No models registered. Router will not serve any models.", file=sys.stderr)
             sys.exit(1)
