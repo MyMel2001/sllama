@@ -232,12 +232,68 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
     Models are loaded on demand.
     """
 
-    def _forward_request(self, method, model_name, forwarded_path, body=None):
+    def _forward_to_endpoint(self, method, model_name, forwarded_path, body=None):
         """
-        Helper method to forward an HTTP request to a target URL with
-        exponential backoff for retries.
-        model_name: The identified name of the model (e.g., "deepseek-r1.gguf")
-        forwarded_path: The path to send to the backend llama-server (e.g., "/v1/chat/completions")
+        Helper method to forward an HTTP request to an external OpenAI-compatible endpoint.
+        """
+        model_info = registered_models[model_name]
+        config_module = model_info.get('config_module')
+        if not config_module:
+            self.send_error(500, f"Endpoint configuration not properly loaded for model '{model_name}'")
+            return
+            
+        try:
+            # Get base URL from the config module
+            base_url = config_module.BASE_URL.rstrip('/')
+            target_url = f"{base_url}{forwarded_path}"
+            
+            # Preserve original query parameters
+            parsed_original_path = urlparse(self.path)
+            if parsed_original_path.query:
+                target_url += f"?{parsed_original_path.query}"
+
+            print(f"Routing {method} request for endpoint model '{model_name}' to: {target_url}", file=sys.stderr)
+
+            # Forward the request to the external endpoint
+            headers = dict(self.headers)
+            # Remove hop-by-hop headers
+            for h in ['host', 'connection', 'keep-alive', 'proxy-authenticate', 
+                     'proxy-authorization', 'te', 'trailers', 'upgrade']:
+                if h in headers:
+                    del headers[h]
+            
+            # Add any necessary authentication headers from the config
+            if hasattr(config_module, 'API_KEY'):
+                api_key = config_module.API_KEY
+                headers['Authorization'] = f"Bearer {api_key}"
+            
+            response = requests.request(
+                method,
+                target_url,
+                headers=headers,
+                data=body,
+                stream=True,
+                timeout=3600
+            )
+
+            # Forward the response back to the client
+            self.send_response(response.status_code)
+            for key, value in response.headers.items():
+                # Skip hop-by-hop headers
+                if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection', 
+                                      'keep-alive', 'proxy-authenticate', 'proxy-authorization', 
+                                      'te', 'trailers', 'upgrade']:
+                    self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(response.content)
+            
+        except Exception as e:
+            print(f"Error forwarding to endpoint '{model_name}': {e}", file=sys.stderr)
+            self.send_error(500, f"Error forwarding to endpoint: {str(e)}")
+
+    def _forward_to_local_model(self, method, model_name, forwarded_path, body=None):
+        """
+        Helper method to forward an HTTP request to a local llama-server process.
         """
         # Ensure the model is active before attempting to forward
         if not activate_model_on_demand(model_name):
@@ -254,7 +310,7 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         if parsed_original_path.query:
             target_url += f"?{parsed_original_path.query}"
 
-        print(f"Routing {method} request for model '{model_name}' to backend: {target_url}", file=sys.stderr)
+        print(f"Routing {method} request for local model '{model_name}' to backend: {target_url}", file=sys.stderr)
 
         retries = 3
         backoff_factor = 0.5 # Initial delay in seconds
@@ -300,6 +356,21 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response.content) # Write the response content (bytes)
 
+    def _forward_request(self, method, model_name, forwarded_path, body=None):
+        """
+        Helper method to forward an HTTP request to the appropriate target.
+        Dispatches to either local model or external endpoint based on model type.
+        """
+        model_info = registered_models.get(model_name)
+        if not model_info:
+            self.send_error(404, f"Model '{model_name}' not found.")
+            return
+            
+        if model_info.get('type') == 'openai_endpoint':
+            self._forward_to_endpoint(method, model_name, forwarded_path, body)
+        else:
+            self._forward_to_local_model(method, model_name, forwarded_path, body)
+
     def do_GET(self):
         parsed_path = urlparse(self.path)
         path_segments = parsed_path.path.strip('/').split('/')
@@ -318,14 +389,21 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 models_data = []
                 print(f"DEBUG (GET /v1/models): Currently registered models: {list(registered_models.keys())}", file=sys.stderr)
                 for name, info in registered_models.items():
-                    # Determine if the model is currently active (process exists and is running)
-                    is_active = 'process' in info and info['process'].poll() is None
+                    # For endpoint models, they're always considered active
+                    if info.get('type') == 'openai_endpoint':
+                        is_active = True
+                        owned_by = "external"
+                    else:
+                        # For local models, check if the process is running
+                        is_active = 'process' in info and info['process'].poll() is None
+                        owned_by = "local"
+                        
                     models_data.append({
                         "id": name,
                         "object": "model",
                         "created": int(time.time()), # Mock creation time
-                        "owned_by": "local",
-                        "active": is_active, # Indicate if the model is currently loaded/active
+                        "owned_by": owned_by,
+                        "active": is_active,
                         "permission": [
                             {"id": f"model-perm-{name}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
                         ],
@@ -345,13 +423,19 @@ class LlamaRouter(http.server.BaseHTTPRequestHandler):
                 model_id_from_path = path_segments[2]
                 if model_id_from_path in registered_models:
                     model_info = registered_models[model_id_from_path]
-                    is_active = 'process' in model_info and model_info['process'].poll() is None
+                    if model_info.get('type') == 'openai_endpoint':
+                        is_active = True
+                        owned_by = "external"
+                    else:
+                        is_active = 'process' in model_info and model_info['process'].poll() is None
+                        owned_by = "local"
+                        
                     response_model_info = {
                         "id": model_id_from_path,
                         "object": "model",
                         "created": int(time.time()),
-                        "owned_by": "local",
-                        "active": is_active, # Indicate if the model is currently loaded/active
+                        "owned_by": owned_by,
+                        "active": is_active,
                         "permission": [
                             {"id": f"model-perm-{model_id_from_path}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}
                         ],
@@ -682,12 +766,17 @@ def main():
     """
     if len(sys.argv) < 2:
         print("Usage:", file=sys.stderr)
-        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile", file=sys.stderr)
-        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file", file=sys.stderr)
-        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face", file=sys.stderr)
-        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
-        print("     - Starts the auto-router on port 11337 and registers models for on-demand loading.", file=sys.stderr)
-        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')", file=sys.stderr)
+        print("  python sllama.py modelfile <filename>      - Run llama-cli using instructions from a Modelfile", file=sys.stderr)
+        print("  python sllama.py run <gguf_file>          - Run a local GGUF model file", file=sys.stderr)
+        print("  python sllama.py run-hug <huggingface_repo> - Run a model directly from Hugging Face", file=sys.stderr)
+        print("  python sllama.py serve <model_name>=<gguf_file> [<model_name>=<endpoint_config.py> ...]", file=sys.stderr)
+        print("     - Starts the auto-router on port 11337 and registers models/endpoints for on-demand loading.", file=sys.stderr)
+        print("     - Supports local GGUF files, modelfiles (directories or files), and external OpenAI-compatible endpoints", file=sys.stderr)
+        print("     - Endpoint configs should be .py files containing BASE_URL and optional API_KEY", file=sys.stderr)
+        print("     - Example endpoint config (my_endpoint.py):", file=sys.stderr)
+        print("         BASE_URL = 'https://api.example.com/v1'", file=sys.stderr)
+        print("         API_KEY = 'your-api-key-here'  # optional", file=sys.stderr)
+        print("  python sllama.py dl-from-ollama <model_id> - Download a GGUF model from Ollama's registry (e.g., 'llama3.2:latest' or 'qwen3')", file=sys.stderr)
         sys.exit(1)
 
     command = sys.argv[1].lower()
@@ -713,18 +802,52 @@ def main():
         run_command("llama-cli", ["-hf", shlex.quote(hf_repo)])
     elif command == "serve": # This is now the unified 'serve' command
         if len(sys.argv) < 3:
-            print("Usage: python sllama.py serve <model_name>=<gguf_file> [<model_name>=<gguf_file>...]", file=sys.stderr)
+            print("Usage: python sllama.py serve <model_name>=<gguf_file_or_endpoint_config> [<model_name>=<gguf_file_or_endpoint_config>...]", file=sys.stderr)
             sys.exit(1)
         
-        # Register models, including support for modelfiles
+        # Register models, including support for modelfiles and endpoints
         for model_arg in sys.argv[2:]:
             if '=' not in model_arg:
-                print(f"Invalid argument format: '{model_arg}'. Expected <model_name>=<gguf_file>", file=sys.stderr)
+                print(f"Invalid argument format: '{model_arg}'. Expected <model_name>=<gguf_file_or_endpoint_config>", file=sys.stderr)
                 continue
-            model_name, gguf_file = model_arg.split('=', 1)
+            model_name, config_path = model_arg.split('=', 1)
             
             # Remove any leading/trailing quotes that might be around the argument string
-            gguf_file = gguf_file.strip('"').strip("'")
+            config_path = config_path.strip('"').strip("'")
+            
+            # Check if this is an endpoint configuration
+            if config_path.lower().endswith('.py'):
+                # This is an endpoint configuration
+                if not os.path.exists(config_path):
+                    print(f"Error: Endpoint config file '{config_path}' not found. Skipping registration.", file=sys.stderr)
+                    continue
+                
+                try:
+                    # Import the endpoint configuration as a module
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(f"endpoint_config_{model_name}", config_path)
+                    config_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(config_module)
+                    
+                    # Verify required BASE_URL exists
+                    if not hasattr(config_module, 'BASE_URL'):
+                        print(f"Error: Endpoint config '{config_path}' must define a BASE_URL variable.", file=sys.stderr)
+                        continue
+                        
+                    # Store the endpoint configuration
+                    registered_models[model_name] = {
+                        'endpoint_config': config_path,
+                        'type': 'openai_endpoint',
+                        'config_module': config_module
+                    }
+                    print(f"OpenAI-compatible endpoint '{model_name}' registered from config '{config_path}'.", file=sys.stderr)
+                    continue
+                except Exception as e:
+                    print(f"Error loading endpoint config '{config_path}': {e}", file=sys.stderr)
+                    continue
+                    
+            # If not an endpoint, treat as GGUF file or modelfile
+            gguf_file = config_path
             
             # --- START OF NEW FOLDER LOGIC ---
             # Check if the path provided is a directory
@@ -768,7 +891,10 @@ def main():
                 if not os.path.exists(gguf_file):
                     print(f"Error: Model file '{gguf_file}' not found. Skipping registration.", file=sys.stderr)
                     continue
-                registered_models[model_name] = {'gguf_path': gguf_file}
+                registered_models[model_name] = {
+                    'gguf_path': gguf_file,
+                    'type': 'gguf'
+                }
                 print(f"Model '{model_name}' registered for on-demand loading from '{gguf_file}'.", file=sys.stderr)
         if not registered_models:
             print("No models registered. Router will not serve any models.", file=sys.stderr)

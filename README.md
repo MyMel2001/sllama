@@ -83,9 +83,29 @@ To directly download and run a model from Hugging Face:
 4. Starting a Model Server (serve)
 To start an HTTP API server for a GGUF model (runs on port 11337 to avoid conflicts with Ollama):
 
-```sllama serve my_api_model.gguf```
+```sllama serve model1=my_api_model.gguf modelfiles=modelfiles/ ollama=ollama-endpoint.py openai=openai-endpoint.py```
 
 This will run one or more instances of ```llama-server``` on random ports with a router on port 11337.
+
+### Configuring Endpoints
+
+You can connect to external OpenAI-compatible endpoints by creating a Python configuration file. The file must define at least a `BASE_URL` variable, and optionally an `API_KEY` for authentication.
+
+Example configuration file (`my_endpoint.py`):
+```python
+# Required: The base URL of the API endpoint
+BASE_URL = "https://api.example.com/v1"
+
+# Optional: API key for authentication (if required)
+API_KEY = "your-api-key-here"
+```
+
+To use the endpoint, specify it when starting the server:
+```bash
+sllama serve my_endpoint=my_endpoint.py
+```
+
+The endpoint will be available at `http://localhost:11337/my_endpoint/v1/...` and will forward requests to the configured base URL.
 
 5. Downloading from Ollama Registry (dl-from-ollama)
 Download GGUF models directly from Ollama's public registry. If no tag is specified, it defaults to latest. The file will be saved in your current directory.
